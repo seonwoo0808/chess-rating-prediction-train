@@ -6,16 +6,11 @@ dist/
 wheels/
 *.egg-info
 
-# Local uv resolution; intentionally not committed
-uv.lock
-
 # Virtual environments
 .venv
-*.sif
 
 .DS_Store
 
 ./data/
 
-# Large temporary container build workspace
-.apptainer-tmp/
+outputs/

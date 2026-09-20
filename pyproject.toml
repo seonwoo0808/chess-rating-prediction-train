@@ -1,23 +1,30 @@
 [project]
 name = "train"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "PyTorch CNN–Transformer chess rating prediction from Parquet games"
 readme = "README.md"
-authors = [
-    { name = "seonwoo0808", email = "me@ptg.kr" }
-]
+authors = [{ name = "seonwoo0808", email = "me@ptg.kr" }]
 requires-python = "==3.12.12"
 dependencies = [
     "numba==0.67.0",
     "numpy==2.5.3",
     "pyarrow==25.0.1",
-    "tensorflow==2.20.0",
-    "keras==3.15.1",
+    "torch==2.10.0",
+    "tqdm==4.67.1",
 ]
 
 [project.scripts]
-train = "train:main"
+train = "train.main:main"
 
 [build-system]
 requires = ["uv_build==0.12.1"]
 build-backend = "uv_build"
+
+# Official CUDA 12.8 wheels on Linux; native PyPI wheels on macOS.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

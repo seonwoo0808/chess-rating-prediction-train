@@ -1,4 +1,4 @@
-"""Run with PYTHONPATH=src uv run --no-sync python -m unittest discover -s tests."""
+"""Board replay, Parquet slicing, tensor batches and split coverage."""
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,7 +7,10 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from data import board_sequence, build_datasets, row_batches, split_counts
+from train.data import board_sequence, build_datasets
+from train.data.batches import row_batches
+from train.data.split import split_counts
+import torch
 
 
 def moves(*uci):
@@ -70,23 +73,25 @@ class DataTests(unittest.TestCase):
         self.assertEqual(split_counts(self.path, None, 0.3), (7, 4))
         self.assertEqual(split_counts(self.path, 5, 0.3), (5, 3))
         train, validation = build_datasets(self.path, batch_size=3, validation_size=0.3,
-                               read_batch_size=2, generator_batch_size=2, decoder='python')
-        training = list(train.as_numpy_iterator())
-        checking = list(validation.as_numpy_iterator())
+                               read_batch_size=2, decoder='python')
+        training = list(train)
+        checking = list(validation)
         self.assertEqual([len(y) for _, y in training], [3, 1])
         self.assertEqual([len(y) for _, y in checking], [3])
         self.assertEqual(set(np.concatenate([y[:, 0] for _, y in training])), set(range(1000,1004)))
         np.testing.assert_array_equal(checking[0][1][:, 0], range(1004, 1007))
-        from models import build_model
+        from train.models import build_model
         model = build_model()
-        prediction = model(training[0][0], training=False).numpy()
+        model.eval()
+        with torch.no_grad():
+            prediction = model(*training[0][0]).numpy()
         self.assertEqual(prediction.shape, (3, 2))
         self.assertTrue(np.isfinite(prediction).all())
 
     def test_invalid_data(self):
         with self.assertRaises(ValueError):
             board_sequence([12 | (28 << 6) | (5 << 12)])
-        from data.parquet import movement_numpy
+        from train.data.parquet import movement_numpy
         with self.assertRaises(ValueError):
             movement_numpy(pa.array([b'x'], type=pa.binary()))
         with self.assertRaises(ValueError):

@@ -12,10 +12,10 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from data import build_datasets
-from data.batches import async_row_batches
-from data.prefetch import prefetched_columns
-from data.split import FileSelection, split_plan
+from train.data import build_datasets
+from train.data.batches import async_row_batches
+from train.data.prefetch import prefetched_columns
+from train.data.split import FileSelection, split_plan
 
 
 class PrefetchTests(unittest.TestCase):
@@ -47,15 +47,15 @@ class PrefetchTests(unittest.TestCase):
             np.testing.assert_array_equal(np.concatenate([y[:, 0] for _, y in blocks]),
                                           range(1000, 1009))
         train, val = build_datasets(self.paths, max_games=13, validation_size=0.3,
-                                   batch_size=4, generator_batch_size=4, decoder='python')
+                                   batch_size=4, decoder='python')
         for _ in range(2):
-            ys = np.concatenate([y[:, 0] for _, y in train.as_numpy_iterator()])
+            ys = np.concatenate([y[:, 0] for _, y in train])
             np.testing.assert_array_equal(np.sort(ys), range(1000, 1009))
-        ys = np.concatenate([y[:, 0] for _, y in val.as_numpy_iterator()])
+        ys = np.concatenate([y[:, 0] for _, y in val])
         np.testing.assert_array_equal(ys, range(1009, 1013))
 
     def test_overlap_two_file_limit_and_projection(self):
-        from data.prefetch import load_file
+        from train.data.prefetch import load_file
         references = []
         second_ready = Event()
         def tracked(selection, cancelled):
@@ -68,7 +68,7 @@ class PrefetchTests(unittest.TestCase):
             if selection.path == self.paths[1]:
                 second_ready.set()
             return table
-        with patch('data.prefetch.load_file', side_effect=tracked):
+        with patch('train.data.prefetch.load_file', side_effect=tracked):
             with closing(prefetched_columns(self.selections, read_batch_size=2)) as source:
                 first = next(source)
                 self.assertTrue(second_ready.wait(5), 'Next file was not loaded during consumption')
@@ -83,7 +83,7 @@ class PrefetchTests(unittest.TestCase):
         self.assertTrue(all(r() is None for r in references))
 
     def test_early_close_cancels_worker(self):
-        from data.prefetch import load_file
+        from train.data.prefetch import load_file
         started, finished = Event(), Event()
         def waiting(selection, cancelled):
             if selection.path == self.paths[1]:
@@ -94,7 +94,7 @@ class PrefetchTests(unittest.TestCase):
                 finally:
                     finished.set()
             return load_file(selection, cancelled)
-        with patch('data.prefetch.load_file', side_effect=waiting):
+        with patch('train.data.prefetch.load_file', side_effect=waiting):
             source = async_row_batches(self.selections, generator_batch_size=2, decoder='python')
             next(source)
             self.assertTrue(started.wait(5))
@@ -102,12 +102,12 @@ class PrefetchTests(unittest.TestCase):
             self.assertTrue(finished.is_set())
 
     def test_worker_exception_reaches_consumer(self):
-        from data.prefetch import load_file
+        from train.data.prefetch import load_file
         def failing(selection, cancelled):
             if selection.path == self.paths[1]:
                 raise OSError('simulated read failure')
             return load_file(selection, cancelled)
-        with patch('data.prefetch.load_file', side_effect=failing):
+        with patch('train.data.prefetch.load_file', side_effect=failing):
             with self.assertRaisesRegex(OSError, 'simulated read failure'):
                 list(async_row_batches(self.selections, decoder='python'))
 

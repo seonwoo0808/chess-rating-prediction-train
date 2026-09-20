@@ -1,7 +1,6 @@
 """Read bounded Parquet row ranges through Arrow buffers."""
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -97,8 +96,7 @@ def arrow_numpy_columns(batch):
 
 
 def column_batches(path: Path, max_games: Optional[int], *,
-         start: int = 0, stop: Optional[int] = None, read_batch_size: int = 512,
-         profile: Optional[dict] = None):
+         start: int = 0, stop: Optional[int] = None, read_batch_size: int = 512):
     """Read/decode only [start, stop); skip other row groups by metadata.
 
     A row group crossing the split may be read by both streams, but each row
@@ -131,24 +129,15 @@ def column_batches(path: Path, max_games: Optional[int], *,
                 row_groups=[group], batch_size=read_batch_size, columns=columns
             ))
             while True:
-                started = time.perf_counter() if profile is not None else 0
                 try:
                     batch = next(batches)
                 except StopIteration:
-                    if profile is not None:
-                        profile["arrow_read_seconds"] += time.perf_counter() - started
                     break
-                if profile is not None:
-                    profile["arrow_read_seconds"] += time.perf_counter() - started
-                    profile["arrow_batches"] += 1
                 left, right = max(0, start-offset), min(batch.num_rows, stop-offset)
                 offset += batch.num_rows
                 if left < right:
-                    started = time.perf_counter() if profile is not None else 0
                     moves, offsets, present, white, black = arrow_numpy_columns(
                         batch.slice(left, right-left))
-                    if profile is not None:
-                        profile["arrow_numpy_seconds"] += time.perf_counter() - started
                     yield moves, offsets, present, white, black
                 if offset >= stop:
                     return

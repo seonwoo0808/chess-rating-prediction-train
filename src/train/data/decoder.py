@@ -63,12 +63,6 @@ def board_sequence(moves: Iterable) -> Tuple[np.ndarray, np.ndarray]:
     return states, valid
 
 
-def _decode_row(item):
-    moves, white_elo, black_elo = item
-    boards, valid = board_sequence(moves)
-    return (boards, valid), np.asarray([white_elo, black_elo], dtype=np.float32)
-
-
 def _decode_into(moves, offsets, present, boards, valid):
     """Numba kernel: sequential games/moves, writes directly into a batch."""
     back_rank = (4, 2, 3, 5, 6, 3, 2, 4)
@@ -114,7 +108,7 @@ def compiled_decoder():
         raise RuntimeError(
             "Numba가 필요합니다. 프로젝트 의존성을 설치하거나 "
             'decoder="python"으로 실행하세요.') from exc
-    # No worker threads, no disk cache, no fastmath, unrelated to GPU/XLA JIT.
+    # No worker threads, no disk cache, no fastmath, independent of the GPU runtime.
     return njit(nogil=True)(_decode_into)
 
 
