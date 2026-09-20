@@ -1,5 +1,4 @@
-"""Step-based training checkpoints and deterministic resumption."""
-from .step_checkpoint import StepCheckpoint, load_checkpoint
-from .resume import fit_resumable
+"""Epoch-level training checkpoints for the standard Keras fit API."""
+from .epoch_checkpoint import EpochCheckpoint, load_epoch_checkpoint
 
-__all__ = ["StepCheckpoint", "load_checkpoint", "fit_resumable"]
+__all__ = ["EpochCheckpoint", "load_epoch_checkpoint"]

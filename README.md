@@ -16,7 +16,6 @@ uv run python -m unittest discover -s tests
 uv run train /data/lichess_monthly \
   --epochs 10 --batch-size 128 \
   --checkpoint-dir outputs/checkpoints \
-  --checkpoint-every 10000 \
   --output-dir outputs/run
 ```
 
@@ -40,7 +39,7 @@ CUDA_VISIBLE_DEVICES=2 \
   ./run_train_apptainer.sh /opt/tensorflow.sif /data/lichess_monthly \
   --epochs 10 --batch-size 1024 \
   --checkpoint-dir outputs/checkpoints \
-  --checkpoint-every 100000
+  --output-dir outputs/run
 ```
 
 스크립트 형식은 `IMAGE DATA_DIR [TRAIN_OPTIONS...]`입니다.
@@ -65,57 +64,47 @@ model = build_model()
 model.fit(train_ds, validation_data=val_ds, epochs=10)
 ```
 
-## 정확한 중간 재시작
+## 에포크 단위 재시작
 
-스텝 단위 체크포인트를 사용할 때는 일반 `model.fit` 대신
-`fit_resumable`을 사용합니다. Keras의 Python generator 데이터셋 iterator는
-그 자체를 저장할 수 없으므로, 체크포인트에는 모델·옵티마이저·지표·난수 상태와
-데이터 매니페스트를 저장하고 재시작 시 같은 epoch의 앞 배치를 결정적으로 다시
-재생한 뒤 저장된 다음 스텝부터 이어갑니다.
+학습은 표준 `model.fit` API를 사용하고, 검증까지 끝난 에포크마다 전체 모델을
+저장합니다. 스텝 중간 상태를 저장하지 않으므로 학습 중 체크포인트 오버헤드가
+작고, 재시작 시 Keras의 `initial_epoch`로 다음 에포크부터 진행합니다.
 
 ```python
-from callbacks import StepCheckpoint, fit_resumable
-from data import ResumableData
+from callbacks import EpochCheckpoint
+from data import build_datasets
+from data.manifest import dataset_manifest
+from models import build_model
 
-data = ResumableData(
-    files, batch_size=128, validation_size=0.05,
-    generator_batch_size=512, decoder="numba", seed=42,
+manifest = dataset_manifest(
+    files, batch_size=128, validation_size=0.05, max_games=None,
+    read_batch_size=512, generator_batch_size=512, decoder="numba",
+    shuffle_buffer=4096, prefetch=2, seed=42,
 )
-checkpoint = StepCheckpoint("outputs/checkpoints", every_n_steps=10_000)
-
-model, history = fit_resumable(
-    build_model(), data, epochs=10, checkpoint=checkpoint,
+train_ds, val_ds = build_datasets(
+    files, batch_size=128, validation_size=0.05, decoder="numba", seed=42,
+)
+model = build_model()
+model.fit(
+    train_ds, validation_data=val_ds, epochs=10,
+    callbacks=[EpochCheckpoint("outputs/checkpoints", manifest)],
 )
 ```
 
-재시작할 때는 새 모델을 만들지 않고 `model=None`과 체크포인트 디렉터리를
-전달합니다.
+명령줄에서는 최신 에포크 체크포인트 디렉터리를 `--resume-from`으로 지정합니다.
+체크포인트의 `model.keras`에는 가중치와 옵티마이저 상태가 함께 들어가며,
+데이터 파일·전처리 코드·학습 설정이 바뀌면 로드를 거부합니다.
 
-```python
-checkpoint = StepCheckpoint("outputs/checkpoints", every_n_steps=10_000)
-model, history = fit_resumable(
-    None, data, epochs=10, checkpoint=checkpoint,
-    resume_from="outputs/checkpoints",
-)
+```bash
+uv run train /data/lichess_monthly \
+  --epochs 10 --resume-from outputs/checkpoints \
+  --checkpoint-dir outputs/checkpoints \
+  --output-dir outputs/run-resumed
 ```
 
-체크포인트 디렉터리에는 `latest.json` 포인터와 원자적으로 완성된
-`step-.../` 디렉터리가 생깁니다. 각 스냅샷은 다음을 포함합니다.
-
-- 저장 시점의 0부터 시작하는 `epoch`, 해당 epoch에서 완료한 `step_in_epoch`, 전체 `global_step`
-- 모델 가중치와 Keras 옵티마이저 슬롯·반복 횟수
-- 학습 지표, Python/NumPy/TensorFlow 난수 상태, 런타임 버전·정밀도
-- 파일 경로·크기·수정 시각, 전처리 코드 해시, 분할·배치 설정
-
-`every_n_steps`는 완료된 학습 배치 기준입니다. epoch 마지막에는 검증이 끝난
-뒤 항상 체크포인트를 하나 더 저장하므로, epoch 완료 지점에서 재시작하면
-검증을 중복하지 않습니다. 중간 스텝 체크포인트에서 재시작하면 해당 epoch의
-검증은 정상적으로 마지막 학습 배치 뒤에 한 번 수행됩니다.
-
-재시작 시 데이터 파일 순서·내용 메타데이터·전처리 코드·배치 설정·TensorFlow/
-Keras 버전·정밀도·분산 전략이 달라지면 즉시 거부합니다. 파일이 변경된 경우
-자동으로 다른 데이터로 계속 학습하지 않습니다. 정확한 재현을 위해
-`steps_per_execution=1` 조건을 사용합니다.
+체크포인트 디렉터리에는 `latest.json`과 원자적으로 완성된 `epoch-.../`
+디렉터리가 생깁니다. 저장 시점은 `on_epoch_end`이므로 해당 에포크의 학습과
+검증이 모두 끝난 뒤입니다.
 
 ## 전처리 모듈
 

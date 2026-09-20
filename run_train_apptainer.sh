@@ -8,7 +8,7 @@ Usage:
 
 Example:
   run_train_apptainer.sh /opt/tensorflow.sif /data/lichess \
-    --epochs 10 --batch-size 1024 --checkpoint-every 100000
+    --epochs 10 --batch-size 1024 --checkpoint-dir outputs/checkpoints
 
 Environment:
   APPTAINER_BIN                 Apptainer executable (default: apptainer)

@@ -12,8 +12,10 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
-from callbacks import StepCheckpoint, fit_resumable
-from data import ResumableData, warmup_decoder
+from callbacks import EpochCheckpoint, load_epoch_checkpoint
+from data import build_datasets, warmup_decoder
+from data.manifest import dataset_manifest
+from data.split import split_plan
 from models import build_model
 
 LOGGER = logging.getLogger(__name__)
@@ -46,7 +48,7 @@ def collect_parquet_files(inputs: Iterable[str | Path]) -> tuple[Path, ...]:
     return tuple(paths)
 
 
-def configure_runtime(*, seed: int, precision: str, deterministic: bool) -> None:
+def configure_runtime(*, seed: int, precision: str) -> None:
     """Set process-wide training settings before constructing a fresh model."""
     if not 0 <= seed < 2**31 - 1:
         raise ValueError("seed must be in [0, 2**31-1)")
@@ -59,8 +61,9 @@ def configure_runtime(*, seed: int, precision: str, deterministic: bool) -> None
     if precision not in {"float32", "mixed_float16", "mixed_bfloat16"}:
         raise ValueError(f"Unsupported precision: {precision}")
     keras.mixed_precision.set_global_policy(precision)
-    # Determinism is enabled by fit_resumable after model construction. Legacy
-    # tf_keras 2.17 cannot build this integer-input model after that switch.
+    # Legacy tf_keras 2.17 cannot build this integer-input model after enabling
+    # operation-level deterministic execution, so keep the process-level seed
+    # setup here and let the standard Keras fit loop manage the epoch lifecycle.
 
 
 def run_training(
@@ -81,16 +84,15 @@ def run_training(
     jit_compile: bool = False,
     skip_padding: bool = False,
     checkpoint_dir: str | Path = "outputs/checkpoints",
-    checkpoint_every: int = 10_000,
     resume_from: str | Path | None = None,
     output_dir: str | Path = "outputs/run",
-    verbose: int = 1,
+    verbose: int = 2,
 ):
     """Run or resume a complete training job.
 
     ``data_paths`` is ordered and is passed to the two-file asynchronous loader.
-    With ``resume_from`` the model, optimizer, metrics, RNG and data position are
-    restored from the latest checkpoint under that directory.
+    Checkpoints are written after complete epochs and resumed with Keras'
+    ``initial_epoch`` API.
     """
     if isinstance(data_paths, (str, Path)):
         data_paths = (data_paths,)
@@ -105,23 +107,19 @@ def run_training(
     if missing:
         raise FileNotFoundError(f"Parquet file not found: {missing[0]}")
 
-    configure_runtime(seed=seed, precision=precision, deterministic=True)
-    data = ResumableData(
-        paths,
-        batch_size=batch_size,
-        validation_size=validation_size,
-        max_games=max_games,
-        read_batch_size=read_batch_size,
-        generator_batch_size=generator_batch_size,
-        decoder=decoder,
-        shuffle_buffer=shuffle_buffer,
-        prefetch=prefetch,
-        seed=seed,
+    configure_runtime(seed=seed, precision=precision)
+    total_games, train_games, _, _ = split_plan(paths, max_games, validation_size)
+    manifest = dataset_manifest(
+        paths, batch_size=batch_size, validation_size=validation_size,
+        max_games=max_games, read_batch_size=read_batch_size,
+        generator_batch_size=generator_batch_size, decoder=decoder,
+        shuffle_buffer=shuffle_buffer, prefetch=prefetch, seed=seed,
     )
     if decoder == "numba":
         warmup_decoder(decoder)
 
-    checkpoint = StepCheckpoint(checkpoint_dir, every_n_steps=checkpoint_every)
+    checkpoint = EpochCheckpoint(checkpoint_dir, manifest)
+    initial_epoch = 0
     if resume_from is None:
         optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
         model = build_model(
@@ -130,20 +128,31 @@ def run_training(
             skip_padding=skip_padding,
         )
     else:
-        model = None
+        model, state = load_epoch_checkpoint(resume_from, manifest)
+        initial_epoch = int(state["completed_epoch"])
+        if initial_epoch > epochs:
+            raise ValueError("epochs is smaller than the saved checkpoint epoch")
+
+    train_ds, validation_ds = build_datasets(
+        paths, batch_size=batch_size, max_games=max_games,
+        validation_size=validation_size, read_batch_size=read_batch_size,
+        generator_batch_size=generator_batch_size, decoder=decoder,
+        shuffle_buffer=shuffle_buffer, prefetch=prefetch, seed=seed,
+    )
 
     LOGGER.info(
         "training files=%d games=%d train=%d validation=%d steps/epoch=%d "
         "batch=%d precision=%s decoder=%s",
-        len(paths), data.total, data.train_count, data.total - data.train_count,
-        data.steps_per_epoch, batch_size, precision, decoder,
+        len(paths), total_games, train_games, total_games - train_games,
+        manifest["steps_per_epoch"], batch_size, precision, decoder,
     )
-    model, history = fit_resumable(
-        model,
-        data,
+    history = model.fit(
+        train_ds,
+        validation_data=validation_ds,
         epochs=epochs,
-        checkpoint=checkpoint,
-        resume_from=resume_from,
+        initial_epoch=initial_epoch,
+        callbacks=[checkpoint],
+        shuffle=False,
         verbose=verbose,
     )
 
@@ -151,21 +160,22 @@ def run_training(
     destination.mkdir(parents=True, exist_ok=True)
     model.save(destination / "model.keras")
     (destination / "history.json").write_text(
-        json.dumps(history, indent=2, ensure_ascii=False) + "\n",
+        json.dumps(history.history, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     run_info = {
         "files": [str(path) for path in paths],
         "epochs": epochs,
-        "total_games": data.total,
-        "train_games": data.train_count,
-        "validation_games": data.total - data.train_count,
-        "steps_per_epoch": data.steps_per_epoch,
+        "total_games": total_games,
+        "train_games": train_games,
+        "validation_games": total_games - train_games,
+        "steps_per_epoch": manifest["steps_per_epoch"],
         "batch_size": batch_size,
         "precision": keras.mixed_precision.global_policy().name,
         "decoder": decoder,
         "checkpoint_dir": str(Path(checkpoint_dir).resolve()),
         "resume_from": None if resume_from is None else str(Path(resume_from).resolve()),
+        "completed_epoch": epochs,
     }
     (destination / "run.json").write_text(
         json.dumps(run_info, indent=2, ensure_ascii=False) + "\n",
@@ -195,11 +205,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jit-compile", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--skip-padding", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("outputs/checkpoints"))
-    parser.add_argument("--checkpoint-every", type=int, default=100000)
     parser.add_argument("--resume-from", type=Path, default=None,
                         help="Checkpoint directory or a specific checkpoint directory")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/run"))
-    parser.add_argument("--verbose", type=int, choices=(0, 1), default=1)
+    parser.add_argument(
+        "--verbose", type=int, choices=(0, 1, 2), default=2,
+        help="Keras fit verbosity: 0=silent, 1=progress bar, 2=one line per epoch",
+    )
     return parser
 
 
@@ -223,7 +235,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         jit_compile=args.jit_compile,
         skip_padding=args.skip_padding,
         checkpoint_dir=args.checkpoint_dir,
-        checkpoint_every=args.checkpoint_every,
         resume_from=args.resume_from,
         output_dir=args.output_dir,
         verbose=args.verbose,

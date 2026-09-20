@@ -22,6 +22,15 @@ class BoardEncoder(layers.Layer):
             layers.Dense(128),
         ], name="board_cnn")
 
+    def build(self, input_shape):
+        # Build the child CNN through a real tensor. This is required for
+        # Keras serialization to restore its variables and also works with
+        # legacy tf_keras, which rejects a symbolic float-only build request
+        # for this integer-input parent layer.
+        if not self.cnn.built:
+            self.cnn(tf.zeros((1, 8, 8, 12), dtype=self.compute_dtype))
+        super().build(input_shape)
+
     def call(self, inputs):
         boards, valid = inputs
         batch, steps = tf.shape(boards)[0], tf.shape(boards)[1]
@@ -51,4 +60,3 @@ class BoardEncoder(layers.Layer):
 
     def get_config(self):
         return {**super().get_config(), "skip_padding": self.skip_padding}
-
