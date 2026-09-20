@@ -15,7 +15,8 @@ class EngineTests(unittest.TestCase):
         batches = [((torch.zeros(n, 1, 8, 8, dtype=torch.int8), torch.ones(n, 1, dtype=torch.bool)),
                     torch.full((n, 2), rating)) for n, rating in ((3, 2.), (1, 10.))]
         metrics = run_epoch(ZeroModel(), batches, device=torch.device("cpu"), precision="float32")
-        self.assertEqual(metrics, {"loss": 28.0, "mae": 4.0})
+        self.assertAlmostEqual(metrics["loss"], 17.139675)
+        self.assertAlmostEqual(metrics["origin_mae"], 1654.0)
 
     def test_nonfinite_loss_fails(self):
         batches = [((torch.zeros(1, 1, 8, 8), torch.ones(1, 1, dtype=torch.bool)),

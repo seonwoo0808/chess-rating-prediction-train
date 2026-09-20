@@ -7,6 +7,11 @@ from tqdm.auto import tqdm
 
 PRECISIONS = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 
+# Ratings are optimized in standardized units. The loss stays standardized;
+# only the reported MAE is converted back to the original rating scale.
+RATING_MEAN = 1660.0
+RATING_STD = 400.0
+
 
 def run_epoch(model, dataset, *, device, precision, optimizer=None, scaler=None,
               progress=False, description=""):
@@ -21,6 +26,10 @@ def run_epoch(model, dataset, *, device, precision, optimizer=None, scaler=None,
     ) as bar:
         for (boards, valid), targets in batches:
             boards, valid, targets = (tensor.to(device) for tensor in (boards, valid, targets))
+            raw_targets = targets.float()
+            if not torch.isfinite(raw_targets).all():
+                raise FloatingPointError("Non-finite rating target")
+            normalized_targets = (raw_targets - RATING_MEAN) / RATING_STD
             if training:
                 optimizer.zero_grad(set_to_none=True)
             with torch.set_grad_enabled(training), torch.autocast(
@@ -28,7 +37,9 @@ def run_epoch(model, dataset, *, device, precision, optimizer=None, scaler=None,
                 enabled=precision != "float32",
             ):
                 predictions = model(boards, valid)
-                error = predictions.float() - targets
+                # Optimize the standardized target; this keeps the regression
+                # loss and its gradients at a numerically well-scaled magnitude.
+                error = predictions.float() - normalized_targets
                 loss = error.square().mean()
             if not torch.isfinite(loss):
                 raise FloatingPointError("Non-finite regression loss")
@@ -36,14 +47,20 @@ def run_epoch(model, dataset, *, device, precision, optimizer=None, scaler=None,
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
-            detached = error.detach()
-            totals += torch.stack((detached.square().sum(), detached.abs().sum())).double()
-            elements += targets.numel()
+            # Keep loss in standardized units. Convert only the MAE to the
+            # original rating scale, using float64 and multiplication by sigma
+            # instead of explicitly materializing prediction * sigma + mean.
+            detached = error.detach().double()
+            metric_error = detached * RATING_STD
+            if not torch.isfinite(metric_error).all():
+                raise FloatingPointError("Non-finite original-scale MAE")
+            totals += torch.stack((detached.square().sum(), metric_error.abs().sum()))
+            elements += raw_targets.numel()
             bar.update(1)
             if progress and (bar.n % 20 == 0 or bar.n == len(dataset)):
-                mse, mae = (totals / elements).tolist()
-                bar.set_postfix(mse=f"{mse:.1f}", mae=f"{mae:.1f}")
+                loss_value, origin_mae = (totals / elements).tolist()
+                bar.set_postfix(loss=f"{loss_value:.4f}", origin_mae=f"{origin_mae:.1f}")
     if not elements:
         raise ValueError("Dataset yielded no games")
-    mse, mae = (totals / elements).tolist()
-    return {"loss": mse, "mae": mae}
+    loss_value, origin_mae = (totals / elements).tolist()
+    return {"loss": loss_value, "origin_mae": origin_mae}

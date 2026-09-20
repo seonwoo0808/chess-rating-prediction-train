@@ -104,7 +104,7 @@ def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, eps=1e-7)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and precision == "float16")
     initial_epoch = 0
-    history = {"loss": [], "mae": [], "val_loss": [], "val_mae": []}
+    history = {"loss": [], "origin_mae": [], "val_loss": [], "val_origin_mae": []}
     if resume_from is not None:
         initial_epoch, history = load_checkpoint(
             resume_from, model=model, optimizer=optimizer, scaler=scaler, manifest=manifest,
@@ -134,8 +134,9 @@ def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
         save_checkpoint(checkpoint_dir, model=model, optimizer=optimizer, scaler=scaler,
                         completed_epoch=epoch + 1, manifest=manifest, history=history)
         if verbose:
-            LOGGER.info("epoch=%d loss=%.3f mae=%.3f val_loss=%.3f val_mae=%.3f", epoch + 1,
-                        train_metrics["loss"], train_metrics["mae"], val_metrics["loss"], val_metrics["mae"])
+            LOGGER.info("epoch=%d loss=%.6f origin_mae=%.3f val_loss=%.6f val_origin_mae=%.3f", epoch + 1,
+                        train_metrics["loss"], train_metrics["origin_mae"],
+                        val_metrics["loss"], val_metrics["origin_mae"])
     destination = Path(output_dir)
     atomic_save(destination / "model.pt", model.state_dict())
     (destination / "history.json").write_text(json.dumps(history, indent=2) + "\n")
