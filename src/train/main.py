@@ -79,7 +79,7 @@ def training_manifest(paths, data_options, *, device, precision, learning_rate):
 
 def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
                  max_games=None, read_batch_size=512, decoder="numba",
-                 shuffle_buffer=4096, seed=42, precision="float32", learning_rate=1e-4,
+                 shuffle_buffer=4096, prefetch_batches=2, seed=42, precision="float32", learning_rate=1e-4,
                  device="auto", checkpoint_dir="outputs/checkpoints", resume_from=None,
                  output_dir="outputs/run", verbose=1):
     if not isinstance(epochs, int) or epochs < 1:
@@ -95,6 +95,7 @@ def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
     data_options = dict(
         batch_size=batch_size, validation_size=validation_size, max_games=max_games or None,
         read_batch_size=read_batch_size, decoder=decoder, shuffle_buffer=shuffle_buffer, seed=seed,
+        prefetch_batches=prefetch_batches,
     )
     training, validation = build_datasets(paths, **data_options)
     manifest = training_manifest(paths, data_options, device=device, precision=precision,
@@ -117,6 +118,7 @@ def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
     LOGGER.info("device=%s replicas=%d games=%d train=%d validation=%d batch=%d precision=%s",
                 device, manifest["replicas"], training.game_count + validation.game_count,
                 training.game_count, validation.game_count, batch_size, precision)
+    LOGGER.info("batch_prefetch=%d (0=inline preparation)", prefetch_batches)
     for epoch in range(initial_epoch, epochs):
         training.set_epoch(epoch)
         train_metrics = run_epoch(
@@ -154,6 +156,8 @@ def build_parser():
     parser.add_argument("--read-batch-size", type=int, default=512)
     parser.add_argument("--decoder", choices=("numba", "python"), default="numba")
     parser.add_argument("--shuffle-buffer", type=int, default=4096)
+    parser.add_argument("--prefetch-batches", type=int, default=2,
+                        help="CPU batches to prepare ahead; 0 disables batch prefetch")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--precision", choices=tuple(PRECISIONS), default="float32")
     parser.add_argument("--learning-rate", type=float, default=1e-4)

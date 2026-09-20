@@ -59,7 +59,7 @@ CUDA 및 복수 GPU의 처리 시간은 서버에서 검증해야 합니다.
 
 ## 입력·전송·가변 배치 비교: pipeline.py
 
-고정 배치는 약 62ms인데 실제 학습이 약 250ms인 차이를 조사하는 도구입니다.
+입력 준비·전송과 모델 실행을 나누어 조사하는 도구입니다.
 `pipeline.py`도 기존 모델·데이터 로더·`run_epoch`를 그대로 import합니다.
 원본 코드 변경이나 monkey patch 없이 iterator 바깥에서 시간을 기록합니다.
 기존 `fixed_batch.py`와 독립적으로 실행할 수 있습니다.
@@ -79,8 +79,8 @@ CUDA_VISIBLE_DEVICES=0,1 uv run --locked python -B benchmarks/pipeline.py \
 |---|---|---|
 | `fixed_gpu` | GPU에 올린 같은 배치 | 기존 학습 루프·DataParallel |
 | `fixed_cpu` | 일반 CPU RAM의 같은 배치 | 위 작업 + 기존 CPU→GPU 전송 |
-| `varied_gpu` | GPU에 올린 실제 16배치를 순서대로 순환 | 배치마다 달라지는 유효 보드 수·CNN 입력 크기 |
-| `varied_cpu` | 같은 실제 16배치를 CPU RAM에서 순환 | 가변 배치 + 기존 CPU→GPU 전송 |
+| `varied_gpu` | GPU에 올린 실제 16배치를 순서대로 순환 | 서로 다른 배치를 현재 원본 모델로 처리 |
+| `varied_cpu` | 같은 실제 16배치를 CPU RAM에서 순환 | 서로 다른 배치 + 기존 CPU→GPU 전송 |
 | `streaming` | 기존 데이터 로더에서 매번 다음 배치 | 실제 입력·전송·학습 전체 |
 | `input_only` | 같은 데이터 로더에서 다음 배치 | 학습 없이 입력 준비만 |
 
@@ -100,8 +100,11 @@ GPU 상주 배치는 첫 GPU에 저장합니다. GPU 간 분배·모델 복제 �
 - `first_batch_prepare_ms`: 첫 파일 적재를 포함한 최초 배치 준비 시간.
   워밍업에 속하며 측정 라운드 평균에서는 제외합니다.
 - `next_wait`: 워밍업 이후 `next(dataset)` 호출 시간의 평균·중앙값·p95·최댓값.
+  배치 prefetch가 켜져 있으면 생산자의 복원 시간 자체가 아니라 준비된 배치를
+  받기까지 소비자가 기다린 시간입니다.
 - `next_wait_by_block_phase`: 복원 블록 안에서 배치 위치별 준비 시간.
   기본 4096게임 블록 / 배치 1024는 주기 4이고 `0`이 새 블록 준비 위치입니다.
+  prefetch 사용 시 실제 소비자 대기 위치는 대기열의 준비 상태에 따라 달라집니다.
   블록 크기가 배치 크기로 나누어떨어지지 않으면 이 그룹 통계를 생략합니다.
 - `input_wait_trace`: 초기 워밍업부터 모든 배치의 번호·라운드·대기 시간·유효 보드 수.
   배치 번호는 0부터 시작하며 워밍업과 라운드 사이에 입력을 다시 시작하지 않습니다.
@@ -120,8 +123,9 @@ GPU 상주 배치는 첫 GPU에 저장합니다. GPU 간 분배·모델 복제 �
 이 값을 더하면 안 됩니다. 배치 메타데이터를 읽는 작은 CPU 계측 비용은 전체
 streaming/input_only 시간에 포함되며 `next_wait_ms`에는 포함되지 않습니다.
 
-가변 배치 은행도 16가지 배치를 재사용하므로 계속 새로운 CNN 크기가 나오는 상황과
-완전히 같지는 않습니다. 기본 워밍업 20회는 16배치를 모두 거칩니다. `--bank-batches`를
+현재 원본 CNN은 고정 크기이므로 `varied`는 입력 내용이 다르다는 뜻이며 CNN 크기는
+고정입니다. 고정/가변 CNN 비교에는 아래 `cnn_shapes.py`를 사용합니다.
+기본 워밍업 20회는 16배치를 모두 거칩니다. `--bank-batches`를
 늘리면 전부 워밍업할 수 있도록 `--warmup`도 함께 늘리는 편이 좋습니다.
 고정 배치와 가변 배치는 평균 게임 길이도 다를 수 있으므로 메타데이터를 함께 비교합니다.
 
@@ -145,6 +149,22 @@ CUDA_VISIBLE_DEVICES=0,1 uv run --locked python -B benchmarks/pipeline.py \
 `--device cpu`는 작은 데이터로 실행 흐름을 확인하기 위한 옵션입니다. 이 경우
 `*_gpu`라는 이름도 CPU 장치 상주를 의미하므로 GPU 성능 결과로 해석하지 않습니다.
 추가 의존성·체크포인트 변경은 없으며 결과까지 포함해 `benchmarks/`만 삭제하면 제거됩니다.
+
+### 배치 prefetch 전후 비교
+
+기본 `--prefetch-batches 2`로 현재 학습과 같은 배치 준비를 사용합니다. 다음 실행과
+같은 명령에서 `--prefetch-batches 0`으로 바꾼 실행을 비교하세요. 결과 JSON에 설정이
+기록됩니다. 두 실행은 동시에 하지 않습니다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 uv run --locked python -B benchmarks/pipeline.py \
+  /data/lichess_monthly --batch-size 1024 --precision bfloat16 \
+  --modes fixed_gpu fixed_cpu streaming input_only --progress --prefetch-batches 2
+```
+
+주요 비교 대상은 `streaming` 시간과 `next_wait`입니다. 입력 전용 순회는 학습이 없어
+대기열을 빠르게 소비하므로, `input_only` 속도가 그대로여도 학습 중 대기가 줄면 효과가
+있습니다. GPU 전송 방식은 바꾸지 않았으므로 `fixed_cpu`의 전송 비용은 남아 있습니다.
 
 ## CNN 입력 크기 고정/가변 비교: cnn_shapes.py
 

@@ -11,6 +11,7 @@ import weakref
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import torch
 
 from train.data import build_datasets
 from train.data.batches import async_row_batches
@@ -119,6 +120,48 @@ class PrefetchTests(unittest.TestCase):
         total, split, train, val = split_plan([empty, *self.paths], None, 0.2)
         self.assertEqual((total, split), (15, 12))
         self.assertNotIn(empty, [s.path for s in (*train, *val)])
+
+    def test_batch_prefetch_preserves_all_tensors_epochs_and_partial_batches(self):
+        for decoder in ('python', 'numba'):
+            options = dict(max_games=13, validation_size=0.3, batch_size=4,
+                           shuffle_buffer=5, decoder=decoder, read_batch_size=2, seed=11)
+            inline = build_datasets(self.paths, prefetch_batches=0, **options)
+            ahead = build_datasets(self.paths, prefetch_batches=2, **options)
+            for epoch in range(3):
+                for original, prefetched in zip(inline, ahead):
+                    original.set_epoch(epoch)
+                    prefetched.set_epoch(epoch)
+                    expected, actual = list(original), list(prefetched)
+                    self.assertEqual(len(expected), len(actual))
+                    for ((eb, ev), ey), ((ab, av), ay) in zip(expected, actual):
+                        for left, right in ((eb, ab), (ev, av), (ey, ay)):
+                            torch.testing.assert_close(left, right, rtol=0, atol=0)
+
+    def test_dataset_close_cancels_nested_file_load(self):
+        from train.data.prefetch import load_file
+        started, finished = Event(), Event()
+        def waiting(selection, cancelled, *, stop_event=None):
+            if selection.path == self.paths[1]:
+                started.set()
+                try:
+                    self.assertIsNotNone(stop_event)
+                    self.assertTrue(stop_event.wait(5), 'Batch cancellation did not reach file load')
+                    return None
+                finally:
+                    finished.set()
+            return load_file(selection, cancelled, stop_event=stop_event)
+        train, _ = build_datasets(self.paths, batch_size=2, shuffle_buffer=2,
+                                  decoder='python', prefetch_batches=2)
+        with patch('train.data.prefetch.load_file', side_effect=waiting):
+            with closing(iter(train)) as batches:
+                next(batches)
+                self.assertTrue(started.wait(5))
+            self.assertTrue(finished.is_set())
+
+    def test_invalid_batch_prefetch_size(self):
+        for size in (-1, 1.5):
+            with self.assertRaisesRegex(ValueError, 'prefetch_batches'):
+                build_datasets(self.paths, prefetch_batches=size)
 
 
 if __name__ == '__main__':

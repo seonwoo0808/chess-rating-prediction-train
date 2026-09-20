@@ -23,11 +23,11 @@ def row_batches(path: Path, max_games: Optional[int], *,
 
 
 def async_row_batches(selections, *, read_batch_size=512,
-                      generator_batch_size=512, decoder="numba"):
+                      generator_batch_size=512, decoder="numba", stop_event=None):
     """Decode across file boundaries; only the epoch's last block is partial."""
     from .prefetch import prefetched_columns
     yield from decode_batches(
-        prefetched_columns(selections, read_batch_size=read_batch_size),
+        prefetched_columns(selections, read_batch_size=read_batch_size, stop_event=stop_event),
         generator_batch_size=generator_batch_size, decoder=decoder)
 
 

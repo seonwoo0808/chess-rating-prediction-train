@@ -49,6 +49,8 @@ def parser():
     result.add_argument("--sample-games", type=int, default=None,
                         help="Default: enough for all steps; 0: full original dataset")
     result.add_argument("--shuffle-buffer", type=positive_int, default=4096)
+    result.add_argument("--prefetch-batches", type=int, default=2,
+                        help="CPU batch prefetch queue size; 0 reproduces inline preparation")
     result.add_argument("--read-batch-size", type=positive_int, default=512)
     result.add_argument("--decoder", choices=("numba", "python"), default="numba")
     result.add_argument("--seed", type=int, default=42)
@@ -174,6 +176,7 @@ def main(argv=None):
         paths, batch_size=args.batch_size, max_games=sample_games or None,
         validation_size=0.05, read_batch_size=args.read_batch_size,
         decoder=args.decoder, shuffle_buffer=args.shuffle_buffer, seed=args.seed,
+        prefetch_batches=args.prefetch_batches,
     )
     if dataset.game_count < needed_batches * args.batch_size:
         raise ValueError(f"Need at least {needed_batches * args.batch_size} training games; "
@@ -272,6 +275,7 @@ def main(argv=None):
         "warmup_steps": args.warmup, "steps_per_round": args.steps, "repeats": args.repeats,
         "seed": args.seed, "sample_games_limit": sample_games, "train_games": dataset.game_count,
         "shuffle_buffer": args.shuffle_buffer, "read_batch_size": args.read_batch_size,
+        "prefetch_batches": args.prefetch_batches,
         "decoder": args.decoder, "progress": args.progress, "mode_order": args.modes,
         "bank_batches": bank_count, "bank_metadata": bank_metadata,
         "cpu_bank_pinned": bool(cpu_bank and cpu_bank[0][0][0].is_pinned()),
@@ -293,6 +297,8 @@ def main(argv=None):
             "Automatic sample cap changes whole-file prefetch sizes. Use --sample-games 0 "
             "to reproduce full-file residency/loading; this can use much more RAM.",
             "Input-only and training run separately; OS caching and file prefetch overlap differ.",
+            "With batch prefetch enabled, next_wait_ms measures queue wait; decoder and shuffle "
+            "run in the producer. Block phase no longer necessarily predicts consumer stalls.",
             "CPU mode is a smoke check; *_gpu names mean device-resident, not measured CUDA.",
         ],
     }

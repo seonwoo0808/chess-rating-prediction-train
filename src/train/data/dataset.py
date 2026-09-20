@@ -6,23 +6,27 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
 from .batches import async_row_batches
+from .batch_prefetch import prefetched_batches
 from .split import split_plan
 
 
 class GameDataset(IterableDataset):
     """Already batched tensors; use directly or DataLoader(batch_size=None).
 
-    The file loader owns its background worker. Extra DataLoader workers would
-    duplicate games and file buffers, so they are deliberately disallowed.
+    File loading and bounded batch production own their background workers.
+    Extra DataLoader workers would duplicate games and file buffers.
     """
     def __init__(self, selections, *, batch_size, shuffle_buffer, seed, decoder,
-                 read_batch_size):
+                 read_batch_size, prefetch_batches=2):
+        if not isinstance(prefetch_batches, int) or prefetch_batches < 0:
+            raise ValueError("prefetch_batches must be a non-negative integer")
         self.selections = selections
         self.batch_size = batch_size
         self.shuffle_buffer = shuffle_buffer
         self.seed = seed
         self.decoder = decoder
         self.read_batch_size = read_batch_size
+        self.prefetch_batches = prefetch_batches
         self.epoch = 0
         self.game_count = sum(part.stop - part.start for part in selections)
 
@@ -34,16 +38,27 @@ class GameDataset(IterableDataset):
 
     def __iter__(self):
         if get_worker_info() is not None:
-            raise RuntimeError("Use num_workers=0; the file loader already prefetches")
-        rng = np.random.default_rng(self.seed + self.epoch)
+            raise RuntimeError("Use num_workers=0; the dataset owns its prefetch workers")
+        epoch = self.epoch
+        if self.prefetch_batches:
+            yield from prefetched_batches(
+                lambda cancelled: self._iter_batches(epoch, cancelled), self.prefetch_batches)
+        else:
+            yield from self._iter_batches(epoch)
+
+    def _iter_batches(self, epoch, cancelled=None):
+        rng = np.random.default_rng(self.seed + epoch)
         source = async_row_batches(
             self.selections, read_batch_size=self.read_batch_size,
             generator_batch_size=max(self.batch_size, self.shuffle_buffer),
             decoder=self.decoder,
+            stop_event=cancelled,
         )
         pending = None
         with closing(source):
             for (boards, valid), targets in source:
+                if cancelled is not None and cancelled.is_set():
+                    return
                 arrays = (boards, valid, targets)
                 if self.shuffle_buffer > 1:
                     order = rng.permutation(len(targets))
@@ -55,6 +70,8 @@ class GameDataset(IterableDataset):
                 count = len(arrays[2])
                 complete = count - count % self.batch_size
                 for start in range(0, complete, self.batch_size):
+                    if cancelled is not None and cancelled.is_set():
+                        return
                     yield self._tensors(arrays, start, start + self.batch_size)
                 if complete < count:
                     # Copy the short tail so it does not keep a large block alive.
@@ -69,13 +86,14 @@ class GameDataset(IterableDataset):
 
 
 def build_datasets(path, *, batch_size=128, max_games=None, validation_size=0.05,
-                   read_batch_size=512, decoder="numba", shuffle_buffer=4096, seed=42):
+                   read_batch_size=512, decoder="numba", shuffle_buffer=4096, seed=42,
+                   prefetch_batches=2):
     if batch_size < 1 or shuffle_buffer < 1 or read_batch_size < 1:
         raise ValueError("batch_size, shuffle_buffer and read_batch_size must be positive")
     if decoder not in ("numba", "python"):
         raise ValueError("decoder must be numba or python")
     _, _, training, validation = split_plan(path, max_games, validation_size)
     options = dict(batch_size=batch_size, seed=seed, decoder=decoder,
-                   read_batch_size=read_batch_size)
+                   read_batch_size=read_batch_size, prefetch_batches=prefetch_batches)
     return (GameDataset(training, shuffle_buffer=shuffle_buffer, **options),
             GameDataset(validation, shuffle_buffer=1, **options))

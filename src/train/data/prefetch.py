@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from functools import partial
 from threading import Event
 import logging
 import time
@@ -15,17 +16,19 @@ from .parquet import arrow_numpy_columns, projected_columns
 logger = logging.getLogger(__name__)
 
 
-def load_file(selection, cancelled):
+def load_file(selection, cancelled, *, stop_event=None):
     """Load selected row groups, keeping Arrow chunks instead of copying them."""
     started = time.perf_counter()
     parts = []
+    def stopped():
+        return cancelled.is_set() or (stop_event is not None and stop_event.is_set())
     try:
         with pq.ParquetFile(selection.path) as source:
             columns = projected_columns(source)
             offset = 0
             last_log = started
             for index in range(source.num_row_groups):
-                if cancelled.is_set():
+                if stopped():
                     return None
                 end = offset + source.metadata.row_group(index).num_rows
                 if offset >= selection.stop:
@@ -41,7 +44,7 @@ def load_file(selection, cancelled):
                     # logger.info('Loading %s: row group %d/%d', selection.path,
                     #             index + 1, source.num_row_groups)
                     last_log = time.perf_counter()
-        if cancelled.is_set():
+        if stopped():
             return None
         result = pa.concat_tables(parts)
         if result.num_rows != selection.stop - selection.start:
@@ -60,7 +63,7 @@ def _table_columns(table, read_batch_size):
             del batch
 
 
-def prefetched_columns(selections, *, read_batch_size=512):
+def prefetched_columns(selections, *, read_batch_size=512, stop_event=None):
     """Yield NumPy columns while at most two file selections are resident/loading.
 
     close() cancels subsequent row groups and joins the worker. An in-flight
@@ -74,8 +77,11 @@ def prefetched_columns(selections, *, read_batch_size=512):
     if first is None:
         return
     cancelled = Event()
+    # Keep file cleanup's local cancellation separate from the batch producer's
+    # stop signal so normal EOF cannot discard the final decoded partial batch.
+    loader = load_file if stop_event is None else partial(load_file, stop_event=stop_event)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='parquet-prefetch')
-    future = executor.submit(load_file, first, cancelled)
+    future = executor.submit(loader, first, cancelled)
     table = None
     try:
         while future is not None:
@@ -85,7 +91,7 @@ def prefetched_columns(selections, *, read_batch_size=512):
                 return
             following = next(selections, None)
             if following is not None:
-                future = executor.submit(load_file, following, cancelled)
+                future = executor.submit(loader, following, cancelled)
             try:
                 with closing(_table_columns(table, read_batch_size)) as columns:
                     yield from columns
