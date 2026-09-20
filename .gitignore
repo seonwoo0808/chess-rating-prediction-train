@@ -16,3 +16,6 @@ uv.lock
 .DS_Store
 
 ./data/
+
+# Large temporary container build workspace
+.apptainer-tmp/
