@@ -1,0 +1,23 @@
+[project]
+name = "train"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "seonwoo0808", email = "me@ptg.kr" }
+]
+requires-python = "==3.12.12"
+dependencies = [
+    "numba>=0.67.0",
+    "numpy>=1.26.4",
+    "pyarrow>=18.0.0",
+    "tensorflow==2.17.0",
+    "tf-keras==2.17.0",
+]
+
+[project.scripts]
+train = "train:main"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"

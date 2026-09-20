@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# uv.lock 멀티 플랫폼이라 커밋 안함
+uv.lock
+
+# Virtual environments
+.venv
+
+.DS_Store
+
