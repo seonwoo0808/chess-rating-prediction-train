@@ -72,7 +72,7 @@ src/train/
   engine.py        공통 학습·검증 루프와 MSE/MAE 집계
   checkpoint.py    원자적 저장과 재시작
   models/
-    cnn.py         유효한 보드만 12채널로 확장하고 CNN 적용
+    cnn.py         패딩 포함 고정 크기로 CNN 적용 후 패딩 특징 마스킹
     transformer.py 사전 정규화 attention/FFN 블록
     rating.py      위치 임베딩, 블록 4개, 마스킹 평균, 레이팅 출력
   data/
@@ -163,7 +163,12 @@ TensorFlow/Keras 의존성, Keras 직렬화·콜백·legacy 호환 코드, XLA/J
 선택형 패딩 처리, 미사용 프로파일러, 중복 `src/main.py` 진입점을 제거했습니다.
 `--jit-compile`, `--skip-padding`, `--generator-batch-size`, `--prefetch`는 제거했고,
 정밀도 이름은 `float32`, `float16`, `bfloat16`으로 통일했습니다.
-패딩 보드는 CNN 처리에서 항상 제외합니다. 기존 `.keras` 파일은 로드/변환하지 않으며
+패딩 보드도 CNN에서 처리해 GPU당 CNN 입력 크기를 `B × 128 + 1`로 유지합니다.
+`+1`은 dummy 보드이며 마지막 부분 배치는 B가 달라질 수 있습니다. 패딩 입력은
+빈 보드로 바꾸고 CNN 출력의 패딩 위치는 0으로 마스킹합니다. `BoardEncoder` 이름과
+가중치 구조는 유지합니다. 이전 가변 크기 코드로 저장한 체크포인트는 기존 코드 해시
+검사 때문에 `--resume-from` 재개가 거부됩니다.
+기존 `.keras` 파일은 로드/변환하지 않으며
 새 PyTorch 학습과 별도 출력 경로를 사용해야 합니다.
 
 ```bash

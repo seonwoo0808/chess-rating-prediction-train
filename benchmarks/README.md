@@ -155,9 +155,11 @@ CUDA_VISIBLE_DEVICES=0,1 uv run --locked python -B benchmarks/cnn_shapes.py \
   --warmup 20 --steps 100 --passes 3
 ```
 
-`dynamic`은 원본 `BoardEncoder`를 그대로 사용합니다. `fixed`는 벤치마크 안에서만
-`FixedShapeEncoder`로 감싸고 **원본 CNN 층과 가중치 구조를 그대로 사용**합니다.
-원본 파일이나 전역 클래스는 수정하지 않습니다.
+원본 `BoardEncoder`가 고정 크기로 변경된 이후에도 비교가 유지되도록 `dynamic`은
+벤치마크 전용 `DynamicShapeEncoder`에 이전의 패딩 제외 경로를 보존합니다.
+`fixed`의 `FixedShapeEncoder`는 원본 `BoardEncoder.forward`를 상속합니다.
+두 방식 모두 **원본 CNN 층과 가중치 구조를 그대로 사용**하며, 벤치마크 실행이
+원본 파일이나 전역 클래스를 수정하지 않습니다.
 
 | 항목 | dynamic | fixed |
 |---|---|---|
@@ -170,7 +172,8 @@ CUDA_VISIBLE_DEVICES=0,1 uv run --locked python -B benchmarks/cnn_shapes.py \
 65537은 `512 × 128 + dummy 1개`입니다. 공정한 비교를 위해 원본처럼 dummy를
 붙이고, one-hot의 int64→float32 변환과 메모리 배치도 유지합니다. 변경하는 것은
 유효 보드 선택/scatter 대신 전체 보드를 처리한 후 출력 마스킹을 하는 부분입니다.
-패딩을 실제 보드처럼 attention에 넣는 실험이 아닙니다.
+고정 방식은 패딩 위치의 입력을 0으로 바꾼 후 채널을 확장하므로 범위를 벗어난
+패딩 값도 기존처럼 무시합니다. 패딩을 실제 보드처럼 attention에 넣는 실험이 아닙니다.
 
 두 방식은 별도 Python 프로세스에서 순서대로 실행하여 PyTorch/cuDNN의 프로세스 내
 캐시 영향을 분리합니다. 데이터·시드·초기 모델·optimizer 설정은 동일하며 실제

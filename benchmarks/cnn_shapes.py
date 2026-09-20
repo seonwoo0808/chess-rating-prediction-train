@@ -1,4 +1,4 @@
-"""Compare original valid-only CNN batches with benchmark-only padded CNN batches."""
+"""Compare benchmark-only valid-board selection with the production fixed CNN."""
 from __future__ import annotations
 
 import argparse
@@ -26,25 +26,28 @@ from train.data import build_datasets, warmup_decoder
 from train.engine import PRECISIONS, run_epoch
 from train.main import collect_parquet_files, configure_runtime
 from train.models import build_model
+from train.models.cnn import BoardEncoder
 
 
-class FixedShapeEncoder(nn.Module):
-    """Reuse the original CNN weights; include padded boards and zero their features."""
+class FixedShapeEncoder(BoardEncoder):
+    """Reuse the production fixed-shape forward and original CNN weights."""
     def __init__(self, original):
-        super().__init__()
+        nn.Module.__init__(self)
         self.cnn = original.cnn
 
+
+class DynamicShapeEncoder(FixedShapeEncoder):
+    """Preserve the former valid-only path as a benchmark baseline."""
     def forward(self, boards, valid):
         batch, steps = valid.shape
-        pieces = boards.reshape(-1, 8, 8).long()
+        indices = valid.reshape(-1).nonzero(as_tuple=True)[0]
+        pieces = boards.reshape(-1, 8, 8)[indices].long()
         channels = pieces.abs() + (pieces < 0) * 6
         encoded = F.one_hot(channels, 13)[..., 1:].permute(0, 3, 1, 2).float()
-        # Preserve the original one-hot dtype, dummy concatenation and layout.
-        # Only valid-position selection/scattering is replaced with output masking.
         dummy = encoded.new_zeros((1, 12, 8, 8))
         features = self.cnn(torch.cat((dummy, encoded)))[1:]
-        features = features.reshape(batch, steps, 128)
-        return features.masked_fill(~valid.unsqueeze(-1), 0)
+        output = features.new_zeros((batch * steps, 128))
+        return output.index_copy(0, indices, features).reshape(batch, steps, 128)
 
 
 class BatchList:
@@ -93,6 +96,8 @@ def make_model(variant):
     model = build_model()
     if variant == "fixed":
         model.board_encoder = FixedShapeEncoder(model.board_encoder)
+    else:
+        model.board_encoder = DynamicShapeEncoder(model.board_encoder)
     return model
 
 
@@ -262,8 +267,8 @@ def main(argv=None):
         report = {"benchmark": "cnn_shapes", "identical_input_verified": True,
                   "variants": reports, "comparisons": comparisons,
                   "notes": [
-                      "Original dynamic encoder is unchanged. Only the fixed benchmark model "
-                      "uses a local encoder wrapper sharing the original CNN module.",
+                      "Fixed uses production BoardEncoder.forward. Dynamic uses the former "
+                      "valid-only selection path in a benchmark-local wrapper sharing the CNN.",
                       "Fixed processes all B*T boards plus the original dummy, then masks invalid "
                       "features to zero before positions/Transformer. Padding semantics preserved.",
                       "Float32 one-hot intermediates, memory layout, precision, Adam, DataParallel "

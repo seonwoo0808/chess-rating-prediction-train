@@ -16,13 +16,14 @@ class BoardEncoder(nn.Module):
 
     def forward(self, boards, valid):
         batch, steps = valid.shape
-        indices = valid.reshape(-1).nonzero(as_tuple=True)[0]
-        pieces = boards.reshape(-1, 8, 8)[indices].long()
+        # Keep B*T boards so changing game lengths do not change CNN shapes.
+        # Ignore padding contents before one-hot, including out-of-range IDs.
+        pieces = boards.masked_fill(~valid[..., None, None], 0).reshape(-1, 8, 8).long()
         # Empty squares use channel 0, which is removed after one-hot encoding.
         channels = pieces.abs() + (pieces < 0) * 6
         encoded = F.one_hot(channels, 13)[..., 1:].permute(0, 3, 1, 2).float()
-        # Keep every parameter in the graph even for an entirely empty batch.
+        # Retain the benchmarked dummy and layout; CNN batch size is B*T+1.
         dummy = encoded.new_zeros((1, 12, 8, 8))
         features = self.cnn(torch.cat((dummy, encoded)))[1:]
-        output = features.new_zeros((batch * steps, 128))
-        return output.index_copy(0, indices, features).reshape(batch, steps, 128)
+        features = features.reshape(batch, steps, 128)
+        return features.masked_fill(~valid.unsqueeze(-1), 0)
