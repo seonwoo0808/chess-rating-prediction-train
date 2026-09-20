@@ -6,7 +6,7 @@ dist/
 wheels/
 *.egg-info
 
-# uv.lock 멀티 플랫폼이라 커밋 안함
+# Local uv resolution; intentionally not committed
 uv.lock
 
 # Virtual environments

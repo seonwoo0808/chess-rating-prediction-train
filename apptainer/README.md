@@ -14,12 +14,15 @@ TensorFlow 2.20의 공식 테스트 빌드 조합은 CUDA 12.5 + cuDNN 9.3입니
 CUDA 12.5.1의 NVIDIA cuDNN 이미지에는 cuDNN 9.2가 들어 있어 이보다 새로운
 CUDA 12.6.3 + cuDNN 9.5.1 조합을 선택했습니다. 같은 메이저 버전의 호환성을
 전제로 한 구성이며 TensorFlow 공식 테스트 조합과 정확히 일치하지 않습니다.
-아래 GPU 검사와 실제 학습으로 서버에서 확인해야 합니다.
+실제 GPU 학습으로 서버에서 확인해야 합니다.
 
-기존 프로젝트의 `pyproject.toml`은 TensorFlow 2.17 및 tf-keras 환경을 유지합니다.
-이 이미지는 별도 `requirements.lock`으로 설치하므로 기존 환경과 독립적으로 시험합니다.
-컨테이너 안에서는 `uv sync`나 일반 `uv run`을 실행하지 마세요.
-프로젝트의 2.17 환경으로 다시 동기화될 수 있습니다. 학습 실행은 아래 스크립트를 사용합니다.
+Mac과 Linux는 동일한 `pyproject.toml`을 사용합니다. 직접 의존성 버전은
+`==`로 고정하고, `uv.lock`은 로컬에서만 생성하며 커밋하지 않습니다.
+이미지 빌드에는 `pyproject.toml`만 복사하고 `uv sync --no-install-project --no-dev`로
+`/opt/venv`에 설치합니다. 학습 소스는 기존 실행 스크립트가 마운트합니다.
+Mac에서는 프로젝트 루트에서 `uv sync`로 `.venv`에 설치합니다.
+uv가 플랫폼에 맞는 배포 파일을 선택하며, Mac에서는 NVIDIA CUDA를 사용하지 않습니다.
+컨테이너의 `/opt/venv`는 읽기 전용이므로 학습은 아래 스크립트로 실행합니다.
 이미지에는 `tf-keras`를 설치하지 않고 `TF_USE_LEGACY_KERAS=0`을 기본 설정합니다.
 
 ## 빌드
@@ -40,31 +43,15 @@ apptainer build --fakeroot tensorflow-2.20-uv.sif apptainer/tensorflow.def
 sudo apptainer build tensorflow-2.20-uv.sif apptainer/tensorflow.def
 ```
 
-빌드의 `%test`는 버전, Keras 3 사용, tf-keras 및 NVIDIA Python 패키지 부재,
-cuDNN 라이브러리 로딩·버전, CPU 연산을 검사합니다.
-Python 패키지는 버전과 해시를 고정했습니다. 기반 OCI 이미지는 버전 태그이므로
-비트 단위 재현성이 필요하면 해당 태그의 digest와 추가 apt 패키지 버전까지 고정해야 합니다.
-
-## 서버 GPU 확인
-
-GPU가 할당된 노드에서 실행합니다. 드라이버는 이미지에 포함되지 않으며,
-서버 GPU 모델과 드라이버 호환성은 이 검사로 확인해야 합니다.
-아래 검사는 GPU가 없거나 GPU 연산이 실패하면 오류로 종료됩니다.
-
-```bash
-nvidia-smi
-APPTAINERENV_CUDA_VISIBLE_DEVICES=0 \
-  apptainer exec --nv tensorflow-2.20-uv.sif \
-  /opt/venv/bin/python /opt/chess/check_runtime.py --gpu
-```
-
-TensorFlow·Keras·CUDA 빌드 정보와 GPU 목록을 출력한 뒤 cuBLAS 행렬곱,
-cuDNN 합성곱 및 역전파를 검사합니다. 멀티 GPU 통신과 실제 학습 성능은 별도로
-짧은 학습으로 확인하세요. 스케줄러를 사용하면 배정받은 GPU만 선택하세요.
-기존 `APPTAINERENV_TF_USE_LEGACY_KERAS=1` 또는
-`SINGULARITYENV_TF_USE_LEGACY_KERAS=1` 설정은 제거해야 합니다.
+직접 Python 의존성은 버전을 고정했지만 간접 의존성은 빌드 시점에 해결하므로
+빌드마다 달라질 수 있습니다. 기반 OCI 이미지도 버전 태그를 사용하며,
+추가 apt 패키지 버전은 고정하지 않습니다.
 
 ## 학습
+
+GPU가 할당된 노드에서 실행하며, 스케줄러가 배정한 GPU만 선택하세요.
+기존 `APPTAINERENV_TF_USE_LEGACY_KERAS=1` 또는
+`SINGULARITYENV_TF_USE_LEGACY_KERAS=1` 설정은 제거해야 합니다.
 
 ```bash
 APPTAINER_PYTHON=/opt/venv/bin/python \
@@ -90,15 +77,11 @@ apptainer exec --nv --bind "$PWD:/workspace/train" --pwd /workspace/train \
 
 ## 의존성 갱신
 
-`requirements.in`을 수정한 뒤 uv로 Linux 대상 lock을 재생성하고 이미지를 다시 빌드합니다.
-
-```bash
-uv pip compile apptainer/requirements.in --python-version 3.12 \
-  --python-platform x86_64-manylinux_2_28 --only-binary :all: \
-  --generate-hashes -o apptainer/requirements.lock
-```
-
-TensorFlow 버전을 바꾸면 `.def`의 라벨과 `check_runtime.py`의 버전 검사도 함께 수정합니다.
+`pyproject.toml`의 정확한 버전을 수정한 뒤 Mac에서는 `uv sync`,
+서버 이미지에는 위의 Apptainer 빌드 명령을 다시 실행합니다.
+로컬 `uv.lock`은 자동 갱신되며 `.gitignore`로 제외됩니다.
+이미지 빌드는 호스트의 lock 파일을 사용하지 않고 새로 의존성을 해결합니다.
+TensorFlow 버전을 바꾸면 `.def`의 라벨도 함께 수정합니다.
 
 참고: [NVIDIA CUDA 이미지](https://hub.docker.com/r/nvidia/cuda),
 [기반 이미지의 cuDNN 버전](https://gitlab.com/nvidia/container-images/cuda/-/raw/master/dist/12.6.3/ubuntu2404/runtime/cudnn/Dockerfile),

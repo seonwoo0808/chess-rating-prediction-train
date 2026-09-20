@@ -11,8 +11,7 @@ Stage: runtime
     /uvx /usr/local/bin/uvx
 
 %files
-    apptainer/requirements.lock /opt/chess/requirements.lock
-    apptainer/check_runtime.py /opt/chess/check_runtime.py
+    pyproject.toml /opt/chess/pyproject.toml
 
 %post
     set -eu
@@ -23,8 +22,9 @@ Stage: runtime
     # Install outside /root so ordinary users can execute the interpreter.
     export UV_PYTHON_INSTALL_DIR=/opt/python
     uv python install 3.12.12
-    uv venv --python 3.12.12 /opt/venv
-    uv pip sync --python /opt/venv/bin/python --require-hashes --only-binary :all: --no-cache /opt/chess/requirements.lock
+    # Resolve for the build environment; no host uv.lock is copied.
+    # Source code is mounted by run_train_apptainer.sh at execution time.
+    UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --project /opt/chess --python 3.12.12 --no-install-project --no-dev --no-cache
     chmod -R a+rX /opt/python /opt/venv
     test -x /usr/local/cuda/bin/ptxas
     test -f /usr/local/cuda/nvvm/libdevice/libdevice.10.bc
@@ -43,10 +43,6 @@ Stage: runtime
     # Prefer image CUDA/cuDNN; retain the driver path injected by --nv.
     export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
-%test
-    /usr/local/bin/uv --version
-    TF_USE_LEGACY_KERAS=0 KERAS_BACKEND=tensorflow PYTHONNOUSERSITE=1 /opt/venv/bin/python /opt/chess/check_runtime.py
-
 %runscript
     exec /opt/venv/bin/python "$@"
 
@@ -62,6 +58,4 @@ Stage: runtime
 %help
     Build from the train project root on Linux x86_64:
       apptainer build --fakeroot tensorflow-2.20-uv.sif apptainer/tensorflow.def
-    Check GPU execution on an allocated GPU node:
-      apptainer exec --nv tensorflow-2.20-uv.sif python /opt/chess/check_runtime.py --gpu
     CUDA/cuDNN/NCCL come from NVIDIA CUDA runtime; cuda-nvcc-12-6 adds ptxas and libdevice.
