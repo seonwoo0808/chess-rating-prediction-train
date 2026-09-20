@@ -145,3 +145,76 @@ CUDA_VISIBLE_DEVICES=0,1 uv run --locked python -B benchmarks/pipeline.py \
 `--device cpu`는 작은 데이터로 실행 흐름을 확인하기 위한 옵션입니다. 이 경우
 `*_gpu`라는 이름도 CPU 장치 상주를 의미하므로 GPU 성능 결과로 해석하지 않습니다.
 추가 의존성·체크포인트 변경은 없으며 결과까지 포함해 `benchmarks/`만 삭제하면 제거됩니다.
+
+## CNN 입력 크기 고정/가변 비교: cnn_shapes.py
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 uv run --locked python -B benchmarks/cnn_shapes.py \
+  /data/lichess_monthly \
+  --batch-size 1024 --precision bfloat16 \
+  --warmup 20 --steps 100 --passes 3
+```
+
+`dynamic`은 원본 `BoardEncoder`를 그대로 사용합니다. `fixed`는 벤치마크 안에서만
+`FixedShapeEncoder`로 감싸고 **원본 CNN 층과 가중치 구조를 그대로 사용**합니다.
+원본 파일이나 전역 클래스는 수정하지 않습니다.
+
+| 항목 | dynamic | fixed |
+|---|---|---|
+| GPU당 입력 게임 수 | 512 | 512 |
+| CNN에 넣는 보드 | 유효한 보드만 | 패딩 포함 모든 보드 |
+| CNN 입력 shape | `[valid.sum()+1, 12, 8, 8]` | `[65537, 12, 8, 8]` |
+| 패딩 위치의 CNN 특징 | scatter 결과의 0 | CNN 처리 후 0으로 마스킹 |
+| Transformer 입력 | `[512, 128, 128]` | `[512, 128, 128]` |
+
+65537은 `512 × 128 + dummy 1개`입니다. 공정한 비교를 위해 원본처럼 dummy를
+붙이고, one-hot의 int64→float32 변환과 메모리 배치도 유지합니다. 변경하는 것은
+유효 보드 선택/scatter 대신 전체 보드를 처리한 후 출력 마스킹을 하는 부분입니다.
+패딩을 실제 보드처럼 attention에 넣는 실험이 아닙니다.
+
+두 방식은 별도 Python 프로세스에서 순서대로 실행하여 PyTorch/cuDNN의 프로세스 내
+캐시 영향을 분리합니다. 데이터·시드·초기 모델·optimizer 설정은 동일하며 실제
+입력 배열 전체의 SHA-256이 같아야 비교 결과를 출력합니다. 원본 소스 해시도 대조합니다.
+측정 순서는 dynamic→fixed이며 OS 캐시·온도·다른 GPU 작업까지 격리되는 것은 아닙니다.
+
+### 최초 순회와 재사용 순회
+
+1. 실제 배치 `20 + 100 = 120개`를 미리 준비하고 로더를 닫습니다.
+2. 앞 20개로 워밍업합니다.
+3. **워밍업과 다른 다음 100개**를 처음 순회하며 측정합니다.
+4. 같은 100개를 같은 순서로 두 번 더 순회합니다. 가중치·Adam은 초기화하지 않습니다.
+
+이전 `pipeline.py`의 16개 배치 순환과 달리, 첫 측정부터 많은 배치별 크기를 만납니다.
+서로 다른 배치의 유효 보드 수가 우연히 같을 수 있으므로, GPU별 서로 다른 크기 수와
+워밍업에서 없었던 크기 수를 결과에 기록합니다. 최초 순회가 모든 크기에 대해
+완전히 차가운 캐시라는 뜻은 아닙니다.
+
+기본 `--residency gpu`는 배치를 첫 GPU에 미리 올립니다. 따라서 데이터 로딩·복원·셔플·
+최초 CPU→GPU 전송을 제외하고, 기존 학습 루프 전체와 DataParallel 비용을 측정합니다.
+원본 전송까지 포함해 비교하려면 `--residency cpu`를 추가하세요. 이 경우에도 데이터는
+CPU RAM에 미리 준비하므로 디코딩 시간은 제외합니다.
+
+기본 배치 은행은 약 **975MiB**입니다. 고정 CNN은 패딩까지 처리하므로 모델 연산용
+메모리는 가변 CNN보다 증가할 수 있습니다. `peak_allocated_mib_per_gpu`로 실제 피크를
+기록합니다. 메모리가 부족하면 양쪽 모두 같은 더 작은 `--batch-size`로 다시 비교하세요.
+`--steps`를 줄이면 저장할 입력 메모리는 줄지만 한 step의 CNN 활성값 메모리는 줄지 않습니다.
+
+### 결과
+
+`benchmarks/results/cnn-shapes-날짜-시간.json`에 전체 결과를 저장합니다.
+터미널에는 각 pass의 dynamic/fixed 시간과 첫 순회·재사용 순회 요약을 표시합니다.
+
+- `comparisons`: 같은 pass에서 양쪽 시간과 fixed 처리량 향상 비율.
+  `fixed_speedup_ratio > 1`이면 fixed가 빠릅니다.
+- `dynamic_first_pass_ms`, `fixed_first_pass_ms`: 처음 만나는 측정 배치들의 평균 시간.
+- `dynamic_replay_median_ms`, `fixed_replay_median_ms`: 2번째 이후 pass 평균 시간들의 중앙값.
+- 전체 JSON의 `batch_shapes`: 워밍업·측정 배치별 실제 CNN 보드 수.
+- `identical_input_verified`: 양쪽에서 읽은 입력·마스크·타깃이 동일한지 확인한 결과.
+
+fixed가 처음부터 빠르고 dynamic은 재사용 후 빨라지면 새로운 입력 크기 처리 비용이
+유력해집니다. 단, 이 비교는 gather/scatter 제거와 패딩 계산량 증가도 함께 포함하므로
+속도 차이만으로 cuDNN 실행 계획 생성 하나를 원인으로 확정하지 않습니다.
+
+JSON 외에 모델이나 입력 데이터를 저장하지 않습니다. 추가 의존성은 없고 이 파일과
+결과도 `benchmarks/` 폴더를 삭제하면 제거됩니다. 두 방식의 출력·기울기·패딩 처리와
+작은 Parquet의 전체 비교 실행은 로컬 CPU에서 검증했으며 CUDA 검증은 서버에서 수행합니다.
