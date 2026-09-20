@@ -1,5 +1,8 @@
 # Chess rating training
 
+uv·TensorFlow 2.20·Keras 3·CUDA 런타임을 포함한 새 서버 이미지는
+[Apptainer 빌드 안내](apptainer/README.md)를 따릅니다.
+
 모델은 `src/models`, 데이터 전처리는 `src/data`에 있습니다.
 현재 `src`를 Python 경로에 추가해 사용합니다.
 

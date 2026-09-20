@@ -1,0 +1,5 @@
+# Independent server environment; deliberately does not install tf-keras.
+tensorflow==2.20.0
+numba==0.67.0
+numpy>=1.26.4
+pyarrow>=18.0.0

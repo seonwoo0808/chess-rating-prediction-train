@@ -11,6 +11,7 @@ uv.lock
 
 # Virtual environments
 .venv
+*.sif
 
 .DS_Store
 
