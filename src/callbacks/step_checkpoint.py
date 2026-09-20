@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from importlib import metadata
 from pathlib import Path
 import random
 import shutil
@@ -16,13 +17,22 @@ from tensorflow import keras
 
 
 def runtime():
+    keras_version = getattr(keras, "__version__", None)
+    if keras_version is None:
+        package = "tf-keras" if keras.__name__.startswith("tf_keras") else "keras"
+        keras_version = metadata.version(package)
     return dict(python=sys.version.split()[0], tensorflow=tf.__version__,
-                keras=keras.__version__, numpy=np.__version__,
+                keras=keras_version, keras_module=keras.__name__, numpy=np.__version__,
                 precision=keras.mixed_precision.global_policy().name)
 
 
 def metric_variables(model):
-    return [v for metric in model.metrics for v in metric.variables]
+    # The loss tracker is an implementation detail and is not recreated by
+    # legacy tf_keras when loading a .keras model. User metrics (MAE, etc.) are
+    # persisted and restored; loss is recomputed from the next batch.
+    return [v for metric in model.metrics
+            if getattr(metric, "name", None) != "loss"
+            for v in metric.variables]
 
 
 def capture_rng():
@@ -181,7 +191,7 @@ def load_checkpoint(path, data):
     model = keras.models.load_model(path / 'model.keras')
     # Build lazy compile metrics without a training/optimizer update.
     dummy = tf.zeros((1, *model.output_shape[1:]), dtype=tf.float32)
-    model.compute_metrics(None, dummy, dummy)
+    model.compute_metrics(None, dummy, dummy, None)
     groups = {'model': list(model.variables), 'optimizer': list(model.optimizer.variables),
               'metrics': metric_variables(model)}
     with np.load(path / 'variables.npz', allow_pickle=False) as arrays:
@@ -190,7 +200,8 @@ def load_checkpoint(path, data):
                 raise ValueError(f'Checkpoint variable count mismatch: {group}')
             for i, variable in enumerate(variables):
                 value = arrays[f'{group}_{i}']
-                if tuple(variable.shape) != value.shape or np.dtype(variable.dtype) != value.dtype:
+                variable_dtype = getattr(variable.dtype, "as_numpy_dtype", variable.dtype)
+                if tuple(variable.shape) != value.shape or np.dtype(variable_dtype) != value.dtype:
                     raise ValueError(f'Checkpoint variable mismatch: {group}[{i}]')
                 variable.assign(value)
     if int(model.optimizer.iterations.numpy()) != state['optimizer_iterations']:

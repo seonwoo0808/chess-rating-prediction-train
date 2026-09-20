@@ -5,8 +5,10 @@ import argparse
 import json
 import logging
 from pathlib import Path
+import random
 from typing import Iterable, Sequence
 
+import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
@@ -48,13 +50,17 @@ def configure_runtime(*, seed: int, precision: str, deterministic: bool) -> None
     """Set process-wide training settings before constructing a fresh model."""
     if not 0 <= seed < 2**31 - 1:
         raise ValueError("seed must be in [0, 2**31-1)")
-    keras.utils.set_random_seed(seed)
+    # tf_keras 2.17 uses Python's random.Random.randint with a float upper
+    # bound under Python 3.12. Seed the three runtimes directly instead.
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
     tf.random.set_global_generator(tf.random.Generator.from_seed(seed))
     if precision not in {"float32", "mixed_float16", "mixed_bfloat16"}:
         raise ValueError(f"Unsupported precision: {precision}")
     keras.mixed_precision.set_global_policy(precision)
-    if deterministic:
-        tf.config.experimental.enable_op_determinism()
+    # Determinism is enabled by fit_resumable after model construction. Legacy
+    # tf_keras 2.17 cannot build this integer-input model after that switch.
 
 
 def run_training(

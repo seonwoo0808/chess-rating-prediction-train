@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import random
 
+import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
@@ -25,9 +27,11 @@ def fit_resumable(model, data, *, epochs, checkpoint: StepCheckpoint,
         raise TypeError('checkpoint must be a StepCheckpoint')
     if resume_from is not None and model is not None:
         raise ValueError('Pass model=None when resume_from is specified')
-    keras.utils.set_random_seed(data.seed)
+    # Avoid tf_keras 2.17's Python 3.12-incompatible set_random_seed helper.
+    random.seed(data.seed)
+    np.random.seed(data.seed)
+    tf.random.set_seed(data.seed)
     tf.random.set_global_generator(tf.random.Generator.from_seed(data.seed))
-    tf.config.experimental.enable_op_determinism()
     strategy = strategy or (model.distribute_strategy if model is not None
                             else tf.distribute.get_strategy())
     state = None
@@ -43,8 +47,12 @@ def fit_resumable(model, data, *, epochs, checkpoint: StepCheckpoint,
         model.optimizer.build(model.trainable_variables)
         if state is None:
             dummy = tf.zeros((1, *model.output_shape[1:]), tf.float32)
-            model.compute_metrics(None, dummy, dummy)
+            model.compute_metrics(None, dummy, dummy, None)
             model.reset_metrics()
+        # Legacy tf_keras 2.17 cannot construct integer-input models after
+        # determinism mode has been enabled. Enable it only after deserialization
+        # and model construction, before the first training step.
+        tf.config.experimental.enable_op_determinism()
 
     topology = dict(strategy=type(strategy).__name__, replicas=strategy.num_replicas_in_sync)
     if state is not None and state.get('topology') != topology:

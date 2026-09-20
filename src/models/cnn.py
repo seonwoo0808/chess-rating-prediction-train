@@ -22,10 +22,6 @@ class BoardEncoder(layers.Layer):
             layers.Dense(128),
         ], name="board_cnn")
 
-    def build(self, input_shape):
-        self.cnn.build((None, 8, 8, 12))
-        super().build(input_shape)
-
     def call(self, inputs):
         boards, valid = inputs
         batch, steps = tf.shape(boards)[0], tf.shape(boards)[1]
@@ -55,5 +51,4 @@ class BoardEncoder(layers.Layer):
 
     def get_config(self):
         return {**super().get_config(), "skip_padding": self.skip_padding}
-
 
