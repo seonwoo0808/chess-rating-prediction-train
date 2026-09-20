@@ -38,16 +38,16 @@ def load_file(selection, cancelled):
                     del table
                 offset = end
                 if time.perf_counter() - last_log >= 5:
-                    logger.info('Loading %s: row group %d/%d', selection.path,
-                                index + 1, source.num_row_groups)
+                    # logger.info('Loading %s: row group %d/%d', selection.path,
+                    #             index + 1, source.num_row_groups)
                     last_log = time.perf_counter()
         if cancelled.is_set():
             return None
         result = pa.concat_tables(parts)
         if result.num_rows != selection.stop - selection.start:
             raise ValueError(f'Parquet row count changed: {selection.path}')
-        logger.info('Loaded %s: %s games, %.3f GiB Arrow, %.2fs', selection.path,
-                    result.num_rows, result.nbytes / 1024**3, time.perf_counter() - started)
+        # logger.info('Loaded %s: %s games, %.3f GiB Arrow, %.2fs', selection.path,
+        #             result.num_rows, result.nbytes / 1024**3, time.perf_counter() - started)
         return result
     finally:
         parts.clear()
