@@ -56,5 +56,5 @@ exec "$apptainer_bin" exec --nv \
   --pwd "$container_root" \
   --env "PYTHONPATH=$container_root/src" \
   --env "TF_AUTOTUNE_THRESHOLD=$autotune_threshold" \
-  "$image" "$python_bin" -m train.main \
+  "$image" "$python_bin" -u -m train.main \
   "$data_container" "$@"

@@ -21,6 +21,27 @@ from models import build_model
 LOGGER = logging.getLogger(__name__)
 
 
+def build_strategy():
+    """Use all visible GPUs when more than one is available."""
+    gpus = tf.config.list_logical_devices("GPU")
+    if len(gpus) > 1:
+        strategy = tf.distribute.MirroredStrategy(
+            devices=[device.name for device in gpus]
+        )
+        LOGGER.info(
+            "multi-GPU strategy=%s devices=%s replicas=%d",
+            type(strategy).__name__, [device.name for device in gpus],
+            strategy.num_replicas_in_sync,
+        )
+        return strategy
+    strategy = tf.distribute.get_strategy()
+    LOGGER.info(
+        "single-device strategy=%s visible_gpus=%d replicas=%d",
+        type(strategy).__name__, len(gpus), strategy.num_replicas_in_sync,
+    )
+    return strategy
+
+
 def collect_parquet_files(inputs: Iterable[str | Path]) -> tuple[Path, ...]:
     """Expand directories into sorted direct-child Parquet files.
 
@@ -86,7 +107,7 @@ def run_training(
     checkpoint_dir: str | Path = "outputs/checkpoints",
     resume_from: str | Path | None = None,
     output_dir: str | Path = "outputs/run",
-    verbose: int = 2,
+    verbose: int = 1,
 ):
     """Run or resume a complete training job.
 
@@ -120,18 +141,20 @@ def run_training(
 
     checkpoint = EpochCheckpoint(checkpoint_dir, manifest)
     initial_epoch = 0
-    if resume_from is None:
-        optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
-        model = build_model(
-            optimizer=optimizer,
-            jit_compile=jit_compile,
-            skip_padding=skip_padding,
-        )
-    else:
-        model, state = load_epoch_checkpoint(resume_from, manifest)
-        initial_epoch = int(state["completed_epoch"])
-        if initial_epoch > epochs:
-            raise ValueError("epochs is smaller than the saved checkpoint epoch")
+    strategy = build_strategy()
+    with strategy.scope():
+        if resume_from is None:
+            optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
+            model = build_model(
+                optimizer=optimizer,
+                jit_compile=jit_compile,
+                skip_padding=skip_padding,
+            )
+        else:
+            model, state = load_epoch_checkpoint(resume_from, manifest)
+            initial_epoch = int(state["completed_epoch"])
+            if initial_epoch > epochs:
+                raise ValueError("epochs is smaller than the saved checkpoint epoch")
 
     train_ds, validation_ds = build_datasets(
         paths, batch_size=batch_size, max_games=max_games,
@@ -145,6 +168,10 @@ def run_training(
         "batch=%d precision=%s decoder=%s",
         len(paths), total_games, train_games, total_games - train_games,
         manifest["steps_per_epoch"], batch_size, precision, decoder,
+    )
+    LOGGER.info(
+        "strategy=%s replicas=%d",
+        type(strategy).__name__, strategy.num_replicas_in_sync,
     )
     history = model.fit(
         train_ds,
@@ -173,6 +200,8 @@ def run_training(
         "batch_size": batch_size,
         "precision": keras.mixed_precision.global_policy().name,
         "decoder": decoder,
+        "strategy": type(strategy).__name__,
+        "replicas": strategy.num_replicas_in_sync,
         "checkpoint_dir": str(Path(checkpoint_dir).resolve()),
         "resume_from": None if resume_from is None else str(Path(resume_from).resolve()),
         "completed_epoch": epochs,
@@ -209,7 +238,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Checkpoint directory or a specific checkpoint directory")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/run"))
     parser.add_argument(
-        "--verbose", type=int, choices=(0, 1, 2), default=2,
+        "--verbose", type=int, choices=(0, 1, 2), default=1,
         help="Keras fit verbosity: 0=silent, 1=progress bar, 2=one line per epoch",
     )
     return parser

@@ -46,6 +46,22 @@ CUDA_VISIBLE_DEVICES=2 \
 `--nv`로 GPU를 전달하고, 컨테이너 안에서 `/workspace/train/src`를
 Python 경로로 설정합니다. TensorFlow 자동 탐색 임계값은
 `TF_AUTOTUNE_THRESHOLD` 환경변수로 바꿀 수 있으며 기본값은 `1`입니다.
+기본 `verbose=1`로 Keras 배치 Progress bar를 출력하며, 서버 로그에는
+`--verbose 2`를 지정하면 에포크별 한 줄 형식으로 출력합니다.
+
+보이는 GPU가 2개 이상이면 학습 코드가 자동으로 TensorFlow
+`MirroredStrategy`를 사용합니다. 예를 들어 GPU 0, 1을 함께 사용하려면 다음처럼
+실행합니다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+  ./run_train_apptainer.sh /opt/tensorflow.sif /data/lichess_monthly \
+  --epochs 10 --batch-size 1024
+```
+
+`--batch-size`는 전체 GPU에 걸친 전역 배치 크기이며, 각 GPU에는 이를 replica 수로
+나눈 배치가 전달됩니다. 시작 시 로그의 `replicas=2` 같은 항목으로 실제 사용 여부를
+확인할 수 있습니다.
 
 ```python
 import logging
