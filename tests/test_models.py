@@ -12,19 +12,33 @@ class ModelTests(unittest.TestCase):
         torch.manual_seed(42)
         self.model = build_model()
         self.boards = torch.randint(-6, 7, (3, 8, 8, 8), dtype=torch.int8)
+        self.game_type = torch.eye(4)[:3]
         self.valid = torch.tensor([[True] * 8, [True] * 3 + [False] * 5, [False] * 8])
 
     def test_shape_padding_invariance_and_empty_game(self):
         self.model.eval()
         with torch.no_grad():
-            expected = self.model(self.boards, self.valid)
+            expected = self.model(self.boards, self.valid, self.game_type)
             changed = self.boards.clone()
             changed[~self.valid] = 99  # Padding is sanitized before piece-channel expansion.
-            actual = self.model(changed, self.valid)
+            actual = self.model(changed, self.valid, self.game_type)
         self.assertEqual(actual.shape, (3, 2))
         self.assertEqual(actual.dtype, torch.float32)
         self.assertTrue(torch.isfinite(actual).all())
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_type_conditions_predictions_and_receives_gradients(self):
+        self.model.eval()
+        boards = self.boards[:1].expand(4, -1, -1, -1)
+        valid = self.valid[:1].expand(4, -1)
+        result = self.model(boards, valid, torch.eye(4))
+        self.assertGreater((result[1:] - result[:1]).abs().max().item(), 1e-6)
+        result.square().sum().backward()
+        grad = self.model.game_type_projection.weight.grad
+        self.assertTrue(torch.isfinite(grad).all())
+        self.assertTrue((grad.abs().sum(dim=0) > 0).all())
+        with self.assertRaisesRegex(ValueError, "game_type"):
+            self.model(boards, valid, torch.ones(4, 3))
 
     def test_cnn_size_does_not_depend_on_valid_count(self):
         encoder = self.model.board_encoder
@@ -62,7 +76,7 @@ class ModelTests(unittest.TestCase):
     def test_backward_and_optimizer_change_parameters(self):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
         previous = self.model.board_encoder.cnn[0].weight.detach().clone()
-        loss = (self.model(self.boards, self.valid) - 1500).square().mean()
+        loss = (self.model(self.boards, self.valid, self.game_type) - 1500).square().mean()
         loss.backward()
         for name, parameter in self.model.named_parameters():
             self.assertIsNotNone(parameter.grad, name)
@@ -71,7 +85,7 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(torch.equal(previous, self.model.board_encoder.cnn[0].weight))
 
     def test_all_padding_backward_is_finite(self):
-        result = self.model(self.boards, torch.zeros_like(self.valid))
+        result = self.model(self.boards, torch.zeros_like(self.valid), self.game_type)
         result.square().mean().backward()
         self.assertTrue(torch.isfinite(result).all())
         for parameter in self.model.parameters():
@@ -80,7 +94,7 @@ class ModelTests(unittest.TestCase):
 
     def test_cpu_autocast_keeps_output_float32(self):
         with torch.autocast("cpu", dtype=torch.bfloat16):
-            result = self.model(self.boards, self.valid)
+            result = self.model(self.boards, self.valid, self.game_type)
         result.square().mean().backward()
         self.assertEqual(result.dtype, torch.float32)
         self.assertTrue(torch.isfinite(result).all())

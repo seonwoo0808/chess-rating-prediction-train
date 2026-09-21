@@ -28,6 +28,7 @@ class PrefetchTests(unittest.TestCase):
             path = Path(self.tmp.name) / f'{i}.parquet'
             move = (12 | (28 << 6)).to_bytes(2, 'little')
             table = pa.table({
+                "game_type": pa.array([[j == i % 4 for j in range(4)] for i in range(5)], type=pa.list_(pa.bool_())),
                 'white_elo': pa.array(range(i * 5 + 1000, i * 5 + 1005), type=pa.uint32()),
                 'black_elo': pa.array(range(i * 5 + 1500, i * 5 + 1505), type=pa.uint32()),
                 'ply_list': pa.array([[{'movement': move, 'time': 300}]] * 5,
@@ -50,7 +51,11 @@ class PrefetchTests(unittest.TestCase):
         train, val = build_datasets(self.paths, max_games=13, validation_size=0.3,
                                    batch_size=4, decoder='python')
         for _ in range(2):
-            ys = np.concatenate([y[:, 0] for _, y in train])
+            batches = list(train)
+            for (_, _, game_type), targets in batches:
+                indices = ((targets[:, 0].long() - 1000) % 5) % 4
+                torch.testing.assert_close(game_type, torch.eye(4)[indices])
+            ys = np.concatenate([y[:, 0] for _, y in batches])
             np.testing.assert_array_equal(np.sort(ys), range(1000, 1009))
         ys = np.concatenate([y[:, 0] for _, y in val])
         np.testing.assert_array_equal(ys, range(1009, 1013))
@@ -133,8 +138,8 @@ class PrefetchTests(unittest.TestCase):
                     prefetched.set_epoch(epoch)
                     expected, actual = list(original), list(prefetched)
                     self.assertEqual(len(expected), len(actual))
-                    for ((eb, ev), ey), ((ab, av), ay) in zip(expected, actual):
-                        for left, right in ((eb, ab), (ev, av), (ey, ay)):
+                    for ((eb, ev, et), ey), ((ab, av, at), ay) in zip(expected, actual):
+                        for left, right in ((eb, ab), (ev, av), (et, at), (ey, ay)):
                             torch.testing.assert_close(left, right, rtol=0, atol=0)
 
     def test_dataset_close_cancels_nested_file_load(self):

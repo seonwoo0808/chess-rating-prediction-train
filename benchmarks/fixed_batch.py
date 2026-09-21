@@ -81,12 +81,12 @@ def main(argv=None):
                          "--sample-games / available data, or reduce --batch-size")
     print("Preparing one real batch; file loading and decoding are not timed.", flush=True)
     with closing(iter(dataset)) as batches:
-        (boards, valid), targets = next(batches)
+        (boards, valid, game_type), targets = next(batches)
     # The loader is closed and its background thread has joined before timing.
     valid_by_replica = [int(part.sum()) for part in valid.chunk(replicas, dim=0)]
     valid_fraction = float(valid.float().mean())
-    fixed = ((boards.to(device), valid.to(device)), targets.to(device))
-    del boards, valid, targets, dataset
+    fixed = ((boards.to(device), valid.to(device), game_type.to(device)), targets.to(device))
+    del boards, valid, game_type, targets, dataset
 
     model = build_model().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, eps=1e-7)

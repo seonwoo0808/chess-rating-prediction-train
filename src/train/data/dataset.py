@@ -56,10 +56,10 @@ class GameDataset(IterableDataset):
         )
         pending = None
         with closing(source):
-            for (boards, valid), targets in source:
+            for (boards, valid, game_type), targets in source:
                 if cancelled is not None and cancelled.is_set():
                     return
-                arrays = (boards, valid, targets)
+                arrays = (boards, valid, targets, game_type)
                 if self.shuffle_buffer > 1:
                     order = rng.permutation(len(targets))
                     arrays = tuple(array[order] for array in arrays)
@@ -81,8 +81,8 @@ class GameDataset(IterableDataset):
 
     @staticmethod
     def _tensors(arrays, start, stop):
-        boards, valid, targets = (torch.from_numpy(array[start:stop]) for array in arrays)
-        return (boards, valid), targets
+        boards, valid, targets, game_type = (torch.from_numpy(array[start:stop]) for array in arrays)
+        return (boards, valid, game_type), targets
 
 
 def build_datasets(path, *, batch_size=128, max_games=None, validation_size=0.05,

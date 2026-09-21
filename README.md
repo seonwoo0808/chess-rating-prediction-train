@@ -113,22 +113,32 @@ src/train/
 같은 학습을 실행합니다.
 
 모델은 Conv2d 3개(32/64/128 채널), 128차원 임베딩, 4-head Transformer 블록 4개,
-256차원 FFN, 마스킹 평균과 백·흑 출력으로 구성됩니다. 기존 모델의 크기와 블록
-구성은 유지하지만 프레임워크의 초기화·연산 구현이 달라 기존 수치와 일치하지 않습니다.
+256차원 FFN, 마스킹 평균과 백·흑 출력으로 구성됩니다. 경기 유형을 위한
+4→128차원 투영층이 추가됩니다. 이전 TensorFlow 모델과는 초기화·연산 구현도 다릅니다.
 
 ## 데이터와 메모리
 
-입력은 `((boards, valid_steps), ratings)`입니다.
+입력은 `((boards, valid_steps, game_type), ratings)`입니다.
 
 - 보드: `int8 [B, 128, 8, 8]`, 빈 칸=0, 백=1..6, 흑=-1..-6.
 - 마스크: `bool [B, 128]`.
+- 경기 유형: `float32 [B, 4]`, Bullet·Blitz·Rapid·Classical 순서의 one-hot.
 - 레이팅: 백·흑 순서의 `float32 [B, 2]`.
 
 각 보드는 수를 둔 직후의 상태입니다. 초기 보드는 제외하고 128 ply를 넘으면 자릅니다.
 캐슬링·앙파상·승격을 복원합니다. 표준 초기 배치에서 시작하는 정상 기보를 전제로 하며,
 완전한 합법수 검증기는 아닙니다. 빈/null 기보는 전부 패딩하고 빈 출발 칸을 만나면
 직전 수까지만 사용합니다. 빈 기보에서도 모델 출력과 역전파가 유한하도록 처리합니다.
-경기 결과·게임 유형·잔여 시간은 입력에 사용하지 않습니다.
+경기 유형은 Parquet의 `game_type` 열에서 읽습니다. 길이 4, 값 0/1, 정확히 하나의
+활성 값이 필요하며 누락/null/잘못된 one-hot은 오류로 처리합니다. 셔플과 배치 분할에서도
+기보·레이팅과 함께 이동합니다. 경기 결과·잔여 시간은 입력에 사용하지 않습니다.
+
+경기 유형을 `Linear(4, 128, bias=False)`로 투영하여 모든 수의 CNN 출력과 위치 임베딩에
+더한 뒤 Transformer에 전달합니다. 추가 파라미터는 512개이며 회귀층은 그대로입니다.
+전부 패딩인 빈 기보는 기존 마스킹 평균으로 0 벡터가 되어 유형별 예측을 하지 않습니다.
+실행 명령은 동일하지만 이전 모델에는 유형 투영 가중치가 없으므로 기존 체크포인트를
+재개하지 말고 새 체크포인트·출력 디렉터리에서 학습하세요. 이 변경 후 저장한 모델끼리는
+기존 재개 기능을 사용할 수 있습니다.
 
 파일을 순서대로 연결한 앞부분은 학습, 뒷부분은 검증입니다. 분할한 뒤 학습 데이터만
 셔플하므로 검증 경계를 넘지 않습니다. 플레이어별 분할이나 별도 테스트 세트는 없습니다.
@@ -177,8 +187,8 @@ uv run train /data/lichess_monthly \
 DDP 재개는 처음과 같은 `torchrun --standalone --nproc-per-node=N -m train ...`
 명령에 `--resume-from`을 추가합니다. 프로세스 수와 배치 크기도 동일해야 합니다.
 체크포인트 형식은 v3입니다. 이전 DataParallel/v2 체크포인트는 재개하지 않으며
-새 체크포인트·출력 디렉터리에서 학습을 시작하세요. 모델 구조와 최종 `model.pt`
-가중치 형식은 바뀌지 않았습니다.
+새 체크포인트·출력 디렉터리에서 학습을 시작하세요. 경기 유형 도입 전 모델 역시
+새 모델의 `game_type_projection.weight`가 없어 그대로 불러오거나 재개할 수 없습니다.
 
 `--epochs`는 추가 횟수가 아니라 최종 에포크 번호입니다. 특정 `.pt` 파일도 지정할 수 있습니다.
 데이터 경로·크기·수정 시각, 전처리/모델/학습 코드, 배치·시드·정밀도·학습률·장치 종류·GPU 수·
@@ -196,7 +206,10 @@ model = build_model()
 model.load_state_dict(torch.load("outputs/run/model.pt", map_location="cpu", weights_only=True))
 model.eval()
 with torch.inference_mode():
-    ratings = model(boards, valid_steps)  # torch.Tensor 입력, 출력 [B, 2]
+    # 예: 배치 전체가 Blitz인 경우. 실제로는 각 경기의 유형을 전달합니다.
+    game_type = torch.tensor([[0., 1., 0., 0.]], device=boards.device).repeat(len(boards), 1)
+    normalized_ratings = model(boards, valid_steps, game_type)  # [B, 2]
+    ratings = normalized_ratings * 400.0 + 1660.0  # 원래 레이팅 단위
 ```
 
 ## 이전 사항과 검증

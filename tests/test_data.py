@@ -38,6 +38,7 @@ class DataTests(unittest.TestCase):
                                        for m in g] for g in self.games]
         pq.write_table(pa.table({
             'ply_list': pa.array(plies, type=ply_type),
+            "game_type": pa.array([[j == i % 4 for j in range(4)] for i in range(7)], type=pa.list_(pa.bool_())),
             'white_elo': pa.array(range(1000, 1007), type=pa.uint32()),
             'black_elo': pa.array(range(1500, 1507), type=pa.uint32()),
         }), self.path, row_group_size=3)
@@ -62,6 +63,8 @@ class DataTests(unittest.TestCase):
             boards = np.concatenate([x[0] for x, _ in blocks])
             valid = np.concatenate([x[1] for x, _ in blocks])
             targets = np.concatenate([y for _, y in blocks])
+            types = np.concatenate([x[2] for x, _ in blocks])
+            np.testing.assert_array_equal(types, np.eye(4)[np.arange(1, 7) % 4])
             for i, game in enumerate(self.games[1:]):
                 expected_board, expected_valid = board_sequence(game)
                 np.testing.assert_array_equal(boards[i], expected_board)
@@ -80,6 +83,9 @@ class DataTests(unittest.TestCase):
         self.assertEqual([len(y) for _, y in checking], [3])
         self.assertEqual(set(np.concatenate([y[:, 0] for _, y in training])), set(range(1000,1004)))
         np.testing.assert_array_equal(checking[0][1][:, 0], range(1004, 1007))
+        for (boards, valid, game_type), targets in training + checking:
+            expected = torch.eye(4)[(targets[:, 0].long() - 1000) % 4]
+            torch.testing.assert_close(game_type, expected)
         from train.models import build_model
         model = build_model()
         model.eval()
@@ -87,6 +93,31 @@ class DataTests(unittest.TestCase):
             prediction = model(*training[0][0]).numpy()
         self.assertEqual(prediction.shape, (3, 2))
         self.assertTrue(np.isfinite(prediction).all())
+
+    def test_invalid_game_types_and_sliced_fixed_lists(self):
+        from train.data.parquet import arrow_numpy_columns, projected_columns
+        table = pq.read_table(self.path).combine_chunks()
+        index = table.schema.get_field_index("game_type")
+        for bad in (None, [True, False], [False] * 4, [True] * 4,
+                    [True, None, False, False], [float("nan"), 0., 0., 0.],
+                    [0.5, 0.5, 0., 0.], ["1", "0", "0", "0"]):
+            with self.subTest(bad=bad):
+                values = pa.array([bad] * len(table))
+                batch = table.set_column(index, "game_type", values).to_batches()[0]
+                with self.assertRaisesRegex(ValueError, "game_type"):
+                    arrow_numpy_columns(batch)
+        without = table.drop(["game_type"])
+        with self.assertRaisesRegex(ValueError, "game_type"):
+            arrow_numpy_columns(without.to_batches()[0])
+        pq.write_table(without, self.path)
+        with pq.ParquetFile(self.path) as source:
+            with self.assertRaisesRegex(ValueError, "game_type"):
+                projected_columns(source)
+        for dtype in (pa.list_(pa.bool_(), 4), pa.large_list(pa.bool_())):
+            values = pa.array([[j == i % 4 for j in range(4)] for i in range(7)], type=dtype)
+            batch = table.set_column(index, "game_type", values).slice(2, 3).to_batches()[0]
+            np.testing.assert_array_equal(arrow_numpy_columns(batch)[-1],
+                                          np.eye(4)[np.arange(2, 5) % 4])
 
     def test_invalid_data(self):
         with self.assertRaises(ValueError):

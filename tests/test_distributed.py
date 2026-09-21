@@ -29,7 +29,7 @@ class SmallModel(torch.nn.Module):
         self.dropout = torch.nn.Dropout(dropout)
         self.linear = torch.nn.Linear(2, 2)
 
-    def forward(self, boards, valid):
+    def forward(self, boards, valid, game_type=None):
         return self.linear(self.dropout(boards.float()))
 
 
@@ -38,17 +38,18 @@ class SmallRatingModel(torch.nn.Module):
         super().__init__()
         self.inner = SmallModel(0.4)
 
-    def forward(self, boards, valid):
+    def forward(self, boards, valid, game_type=None):
         return self.inner(boards[:, 0, 0, :2], valid)
 
 
 def batches(n, rating=1860.0):
-    return [((torch.ones(n, 2), torch.ones(n, 1, dtype=torch.bool)),
+    return [((torch.ones(n, 2), torch.ones(n, 1, dtype=torch.bool), torch.tensor([[1., 0., 0., 0.]]).repeat(n, 1)),
              torch.full((n, 2), rating))] if n else []
 
 
 def write_games(path, start, count):
     pq.write_table(pa.table({
+        "game_type": pa.array([[j == i % 4 for j in range(4)] for i in range(count)], type=pa.list_(pa.bool_())),
         "white_elo": [1000.0 + i for i in range(start, start + count)],
         "black_elo": [1500.0 + i for i in range(start, start + count)],
         "ply_list": pa.array([[12 | (28 << 6)]] * count, type=pa.list_(pa.uint16())),

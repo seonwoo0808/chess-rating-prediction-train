@@ -133,8 +133,8 @@ def worker(args):
     print(f"[{args.variant}] Preparing {needed} real batches; not timed", flush=True)
     with closing(iter(dataset)) as source:
         for index in range(needed):
-            (boards, valid), targets = next(source)
-            arrays = (boards, valid, targets)
+            (boards, valid, game_type), targets = next(source)
+            arrays = (boards, valid, targets, game_type)
             counts = [int(part.numpy().sum()) for part in valid.chunk(replicas)]
             metadata.append({"batch_index": index,
                              "phase": "warmup" if index < args.warmup else "measured",
@@ -150,10 +150,10 @@ def worker(args):
                     saved = [tensor.clone() for tensor in saved]
             else:
                 saved = [tensor.clone() for tensor in arrays]
-            bank.append(((saved[0], saved[1]), saved[2]))
+            bank.append(((saved[0], saved[1], saved[3]), saved[2]))
             if (index + 1) % 20 == 0:
                 print(f"[{args.variant}] Prepared {index + 1}/{needed}", flush=True)
-    del boards, valid, targets, arrays, saved, dataset
+    del boards, valid, game_type, targets, arrays, saved, dataset
     sync()
     # Both variants initialize from the same seed, after identical data preparation.
     configure_runtime(args.seed, args.device, args.precision)

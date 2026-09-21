@@ -6,7 +6,7 @@ from train.engine import run_epoch
 
 
 class ZeroModel(torch.nn.Module):
-    def forward(self, boards, valid):
+    def forward(self, boards, valid, game_type=None):
         return torch.zeros((len(boards), 2))
 
 
@@ -15,19 +15,19 @@ class ConstantModel(torch.nn.Module):
         super().__init__()
         self.output = torch.nn.Parameter(torch.full((2,), 10.0))
 
-    def forward(self, boards, valid):
+    def forward(self, boards, valid, game_type=None):
         return self.output.expand(len(boards), -1)
 
 
 class EngineTests(unittest.TestCase):
     def test_metrics_weight_partial_batch_by_game_count(self):
-        batches = [((torch.zeros(n, 1, 8, 8, dtype=torch.int8), torch.ones(n, 1, dtype=torch.bool)),
+        batches = [((torch.zeros(n, 1, 8, 8, dtype=torch.int8), torch.ones(n, 1, dtype=torch.bool), torch.tensor([[1., 0., 0., 0.]]).repeat(n, 1)),
                     torch.full((n, 2), rating)) for n, rating in ((3, 2060.), (1, 2860.))]
         metrics = run_epoch(ZeroModel(), batches, device=torch.device("cpu"), precision="float32")
         self.assertEqual(metrics, {"loss": 3.0, "origin_mae": 600.0})
 
     def test_clipping_bounds_update_after_unscaling(self):
-        batches = [((torch.zeros(1, 1, 8, 8), torch.ones(1, 1, dtype=torch.bool)),
+        batches = [((torch.zeros(1, 1, 8, 8), torch.ones(1, 1, dtype=torch.bool), torch.tensor([[1., 0., 0., 0.]])),
                     torch.full((1, 2), 1660.0))]
         for precision, scaling in (("float32", False), ("bfloat16", False), ("float32", True)):
             with self.subTest(precision=precision, scaling=scaling):
@@ -45,7 +45,7 @@ class EngineTests(unittest.TestCase):
         before = model.output.detach().clone()
         model.output.register_hook(lambda grad: torch.full_like(grad, float("inf")))
         optimizer = torch.optim.Adam(model.parameters())
-        batches = [((torch.zeros(1, 1, 8, 8), torch.ones(1, 1, dtype=torch.bool)),
+        batches = [((torch.zeros(1, 1, 8, 8), torch.ones(1, 1, dtype=torch.bool), torch.tensor([[1., 0., 0., 0.]])),
                     torch.full((1, 2), 1660.0))]
         with self.assertRaisesRegex(RuntimeError, "non-finite"):
             run_epoch(model, batches, device=torch.device("cpu"), precision="bfloat16",
@@ -54,7 +54,7 @@ class EngineTests(unittest.TestCase):
         self.assertFalse(optimizer.state)
 
     def test_nonfinite_loss_fails(self):
-        batches = [((torch.zeros(1, 1, 8, 8), torch.ones(1, 1, dtype=torch.bool)),
+        batches = [((torch.zeros(1, 1, 8, 8), torch.ones(1, 1, dtype=torch.bool), torch.tensor([[1., 0., 0., 0.]])),
                     torch.full((1, 2), float("nan")))]
         with self.assertRaises(FloatingPointError):
             run_epoch(ZeroModel(), batches, device=torch.device("cpu"), precision="float32")
