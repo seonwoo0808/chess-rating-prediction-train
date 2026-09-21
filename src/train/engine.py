@@ -11,6 +11,7 @@ PRECISIONS = {"float32": torch.float32, "float16": torch.float16, "bfloat16": to
 # only the reported MAE is converted back to the original rating scale.
 RATING_MEAN = 1660.0
 RATING_STD = 400.0
+MAX_GRAD_NORM = 1.0
 
 
 def run_epoch(model, dataset, *, device, precision, optimizer=None, scaler=None,
@@ -45,6 +46,11 @@ def run_epoch(model, dataset, *, device, precision, optimizer=None, scaler=None,
                 raise FloatingPointError("Non-finite regression loss")
             if training:
                 scaler.scale(loss).backward()
+                # Clip actual gradients after loss scaling has been undone.
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=MAX_GRAD_NORM, error_if_nonfinite=True,
+                )
                 scaler.step(optimizer)
                 scaler.update()
             # Keep loss in standardized units. Convert only the MAE to the

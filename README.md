@@ -30,8 +30,12 @@ CUDA_VISIBLE_DEVICES=0,1 uv run train /data/lichess_monthly \
 ```
 
 기본 정밀도는 `float32`입니다. `float16`은 CUDA에서 GradScaler와 함께 사용하고,
-`bfloat16`은 CPU 또는 지원하는 CUDA GPU에서 사용합니다. 레이팅 출력·MSE·MAE는
-float32로 계산합니다. `--verbose 1`은 배치 진행률, `2`는 에포크 요약,
+`bfloat16`은 CPU 또는 지원하는 CUDA GPU에서 사용합니다. 타깃은 `(rating - 1660) / 400`으로
+표준화하고 출력·학습 MSE는 float32로 계산합니다. `loss`는 표준화된 MSE이며,
+`origin_mae`는 float64에서 오차에 400을 곱해 원래 레이팅 단위로 집계합니다.
+매 학습 배치에서 역전파 후 전체 gradient L2 norm을 상수 `1.0`으로 제한합니다.
+GradScaler 사용 시 unscale 후 clipping하며, norm이 NaN/Inf이면 가중치 갱신 전에 중단합니다.
+`--verbose 1`은 배치 진행률, `2`는 에포크 요약,
 `0`은 학습 진행 표시를 끕니다. 데이터 적재 로그는 별도로 출력됩니다.
 
 ## 서버에서 uv 가상환경으로 실행
