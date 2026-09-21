@@ -20,14 +20,30 @@ Python 함수와 CLI의 기본값이 같습니다. `--max-games 2000 --epochs 1`
 
 `--device auto`는 CUDA가 있으면 사용하고, 없으면 CPU를 사용합니다.
 `--device cpu` 또는 `--device cuda`로 고정할 수 있습니다.
-CUDA GPU가 여러 개 보이면 `torch.nn.DataParallel`로 전역 배치를 분배합니다.
-입력은 한 프로세스에서 준비하므로 GPU 수에 따라 파일 버퍼가 복제되지 않습니다.
-GPU 선택은 `CUDA_VISIBLE_DEVICES`로 제한합니다. DDP/다중 노드 실행은 지원하지 않습니다.
+여러 GPU는 `torchrun`으로 GPU당 프로세스 하나를 실행하여
+`DistributedDataParallel`(DDP)을 사용합니다. CUDA 통신은 NCCL을 사용하며
+각 프로세스는 `LOCAL_RANK`에 해당하는 GPU만 사용합니다.
+GPU 선택은 `CUDA_VISIBLE_DEVICES`로 제한합니다.
+일반 `uv run train` / `python -m train` 실행은 보이는 GPU가 많아도 **한 GPU**를 사용합니다.
+이 문서의 실행 예제와 지원 범위는 단일 머신이며, CPU 분산 테스트는 Gloo를 사용합니다.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 uv run train /data/lichess_monthly \
+CUDA_VISIBLE_DEVICES=0,1 uv run --locked torchrun --standalone --nproc-per-node=2 \
+  -m train /data/lichess_monthly \
   --batch-size 128 --precision bfloat16
 ```
+
+`--batch-size`는 **전체 프로세스 합산 배치**입니다. 위 설정은 GPU당 64게임이며
+프로세스 수의 배수여야 합니다. GPU 4개면 `--nproc-per-node=4`로 바꿉니다.
+학습률은 자동으로 변경하지 않습니다. 데이터는 분할 후 각 rank에 연속 구간을
+배정하여 해당 구간만 읽고 복원하고, 구간 안에서 에포크별로 셔플합니다.
+모든 rank의 학습 배치 크기와 스텝 수를 맞추기 위해 학습 끝부분의 최대
+`프로세스 수 - 1`게임을 제외합니다. 나머지 마지막 부분 배치는 보존하며,
+제외 수는 로그와 `run.json`의 `dropped_train_games`에 기록합니다.
+학습 게임 수가 프로세스 수보다 작으면 실행을 거부합니다.
+검증은 게임을 제외하거나 중복하지 않으며, 검증 데이터가 없는 rank도 처리합니다.
+에포크 지표는 모든 rank의 오차 합과 타깃 수를 합산합니다.
+진행 막대의 중간 지표는 rank 0 기준이고, 에포크 요약과 저장된 지표는 전체 기준입니다.
 
 기본 정밀도는 `float32`입니다. `float16`은 CUDA에서 GradScaler와 함께 사용하고,
 `bfloat16`은 CPU 또는 지원하는 CUDA GPU에서 사용합니다. 타깃은 `(rating - 1660) / 400`으로
@@ -59,7 +75,8 @@ CUDA_VISIBLE_DEVICES=0 python -m train /data/lichess_monthly \
 직접 활성화하지 않아도 같은 `.venv`에서 실행됩니다.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 uv run --locked train /data/lichess_monthly \
+CUDA_VISIBLE_DEVICES=0,1 uv run --locked torchrun --standalone --nproc-per-node=2 \
+  -m train /data/lichess_monthly \
   --device cuda --epochs 10 --batch-size 128 --precision bfloat16 \
   --checkpoint-dir outputs/checkpoints --output-dir outputs/run
 ```
@@ -73,6 +90,7 @@ CUDA_VISIBLE_DEVICES=0,1 uv run --locked train /data/lichess_monthly \
 ```text
 src/train/
   main.py          CLI, 실행 설정, 에포크 흐름
+  distributed.py   torchrun 초기화·정리, rank/프로세스 수
   engine.py        공통 학습·검증 루프와 MSE/MAE 집계
   checkpoint.py    원자적 저장과 재시작
   models/
@@ -115,16 +133,20 @@ src/train/
 파일을 순서대로 연결한 앞부분은 학습, 뒷부분은 검증입니다. 분할한 뒤 학습 데이터만
 셔플하므로 검증 경계를 넘지 않습니다. 플레이어별 분할이나 별도 테스트 세트는 없습니다.
 
-학습은 `max(batch_size, shuffle_buffer)`개 게임 블록 안에서 무작위 순열을 만들며,
+학습은 rank마다 `max(해당 rank의 batch_size, shuffle_buffer)`개 게임 블록 안에서 무작위 순열을 만들며,
 에포크 번호와 시드로 순서를 결정합니다. 기본 `shuffle_buffer=4096`입니다.
 기존 입력 파이프라인의 교체식 shuffle과 순서는 다르며 전체 데이터 무작위 셔플은 아닙니다.
 마지막 부분 배치를 보존하고 MSE/MAE를 실제 타깃 개수로 가중 집계합니다.
+DDP에서는 위 실행 환경 절의 학습 끝부분 제외 규칙을 먼저 적용합니다.
 
-현재 파일과 다음 파일의 이동·레이팅을 Arrow로 적재합니다. 이 두 파일에는 바이트 단위
+각 rank가 현재 파일과 다음 파일의 담당 구간을 Arrow로 적재합니다. 구간 경계가
+row group 내부이면 해당 row group 읽기는 겹칠 수 있습니다. 파일 버퍼·복원 블록·
+prefetch 대기열은 프로세스마다 별도로 존재하므로 GPU 수를 늘릴 때 CPU 메모리와
+디스크 읽기 부하도 확인해야 합니다. 이 두 파일에는 바이트 단위
 메모리 상한이 없습니다. 보드 배열은 블록 단위로 복원하며 전체 게임 보드를 캐시하지 않습니다.
 `--read-batch-size`는 Arrow에서 디코더에 넘길 행 수이고 파일 적재량 제한이 아닙니다.
 파일 로딩과 별도로 생산자 스레드 하나가 보드 복원·셔플·텐서 배치를 미리 준비합니다.
-기본 `--prefetch-batches 2`는 준비된 CPU 배치 대기열을 최대 2개로 제한합니다.
+기본 `--prefetch-batches 2`는 각 rank의 준비된 CPU 배치 대기열을 최대 2개로 제한합니다.
 `--prefetch-batches 0`은 기존처럼 학습 루프에서 배치를 준비하는 비교 경로입니다.
 셔플 순서와 마지막 부분 배치는 같으며 CUDA 전송은 기존 학습 루프에서 수행합니다.
 대기열 외에 생산 중인 배치와 셔플 블록이 존재하고, 텐서가 블록 배열을 공유하므로
@@ -141,7 +163,8 @@ src/train/
 
 검증까지 완료한 에포크마다 `epoch-000001.pt` 등을 저장하고 `latest.json`을 갱신합니다.
 임시 파일을 모두 쓴 뒤 교체하므로 저장 실패 시 이전 최신 체크포인트를 유지합니다.
-가중치, Adam 상태, GradScaler 상태, PyTorch CPU/CUDA 난수 상태와 전체 지표 이력을 저장합니다.
+rank 0만 파일을 저장하며 가중치에 `module.` 접두사를 붙이지 않습니다.
+가중치, Adam 상태, GradScaler 상태, **rank별** PyTorch CPU/CUDA 난수 상태와 전체 지표 이력을 저장합니다.
 스텝 중간 재시작은 지원하지 않습니다.
 
 ```bash
@@ -150,6 +173,12 @@ uv run train /data/lichess_monthly \
   --resume-from outputs/checkpoints \
   --checkpoint-dir outputs/checkpoints --output-dir outputs/run-resumed
 ```
+
+DDP 재개는 처음과 같은 `torchrun --standalone --nproc-per-node=N -m train ...`
+명령에 `--resume-from`을 추가합니다. 프로세스 수와 배치 크기도 동일해야 합니다.
+체크포인트 형식은 v3입니다. 이전 DataParallel/v2 체크포인트는 재개하지 않으며
+새 체크포인트·출력 디렉터리에서 학습을 시작하세요. 모델 구조와 최종 `model.pt`
+가중치 형식은 바뀌지 않았습니다.
 
 `--epochs`는 추가 횟수가 아니라 최종 에포크 번호입니다. 특정 `.pt` 파일도 지정할 수 있습니다.
 데이터 경로·크기·수정 시각, 전처리/모델/학습 코드, 배치·시드·정밀도·학습률·장치 종류·GPU 수·
@@ -192,3 +221,7 @@ uv run python -m unittest discover -s tests -v
 마스킹·빈 기보·역전파·CPU bfloat16, 지표 집계, 실제 모델의 연속 학습과 저장 후 재시작
 결과 일치를 확인합니다. 로컬 검증은 macOS CPU 기준이며 Linux 서버의
 CUDA·복수 GPU 실행은 대상 서버에서 확인해야 합니다.
+DDP는 실제 Gloo 프로세스 2개에서 전역 배치와 gradient 일치, 불균등/빈 검증 구간,
+rank별 난수 상태를 포함한 재개 일치, `torchrun`을 통한 실제 CNN–Transformer
+학습과 저장을 검사합니다. 기존 `benchmarks/` 도구는 DataParallel 비교용으로
+남겨 두었으며 DDP 성능 측정용이 아닙니다.

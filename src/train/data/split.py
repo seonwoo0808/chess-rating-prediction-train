@@ -55,3 +55,17 @@ def split_plan(paths, max_games, test_size):
 def split_counts(path, max_games, test_size):
     total, split, _, _ = split_plan(path, max_games, test_size)
     return total, split
+
+
+def slice_selections(selections, start, stop):
+    """Select a global interval without reading/decoding other ranks' games."""
+    result = []
+    offset = 0
+    for part in selections:
+        count = part.stop - part.start
+        left, right = max(start, offset), min(stop, offset + count)
+        if left < right:
+            result.append(FileSelection(part.path, part.start + left - offset,
+                                        part.start + right - offset))
+        offset += count
+    return tuple(result)

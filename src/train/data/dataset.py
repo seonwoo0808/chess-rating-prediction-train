@@ -7,7 +7,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 from .batches import async_row_batches
 from .batch_prefetch import prefetched_batches
-from .split import split_plan
+from .split import slice_selections, split_plan
 
 
 class GameDataset(IterableDataset):
@@ -87,13 +87,28 @@ class GameDataset(IterableDataset):
 
 def build_datasets(path, *, batch_size=128, max_games=None, validation_size=0.05,
                    read_batch_size=512, decoder="numba", shuffle_buffer=4096, seed=42,
-                   prefetch_batches=2):
+                   prefetch_batches=2, rank=0, world_size=1):
     if batch_size < 1 or shuffle_buffer < 1 or read_batch_size < 1:
         raise ValueError("batch_size, shuffle_buffer and read_batch_size must be positive")
     if decoder not in ("numba", "python"):
         raise ValueError("decoder must be numba or python")
-    _, _, training, validation = split_plan(path, max_games, validation_size)
-    options = dict(batch_size=batch_size, seed=seed, decoder=decoder,
+    if world_size < 1 or not 0 <= rank < world_size:
+        raise ValueError("Require world_size >= 1 and 0 <= rank < world_size")
+    if batch_size % world_size:
+        raise ValueError("Global batch_size must be divisible by world_size")
+    total, split, training, validation = split_plan(path, max_games, validation_size)
+    train_count = split - split % world_size
+    if train_count == 0:
+        raise ValueError("Training requires at least one game per rank")
+    local_count = train_count // world_size
+    training = slice_selections(training, rank * local_count, (rank + 1) * local_count)
+    validation = slice_selections(validation, (total - split) * rank // world_size,
+                                  (total - split) * (rank + 1) // world_size)
+    options = dict(batch_size=batch_size // world_size, seed=seed + rank, decoder=decoder,
                    read_batch_size=read_batch_size, prefetch_batches=prefetch_batches)
-    return (GameDataset(training, shuffle_buffer=shuffle_buffer, **options),
-            GameDataset(validation, shuffle_buffer=1, **options))
+    train = GameDataset(training, shuffle_buffer=shuffle_buffer, **options)
+    val = GameDataset(validation, shuffle_buffer=1, **options)
+    train.global_game_count = train_count
+    train.dropped_game_count = split - train_count
+    val.global_game_count = total - split
+    return train, val

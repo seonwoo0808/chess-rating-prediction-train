@@ -5,9 +5,12 @@ from pathlib import Path
 import uuid
 
 import torch
+import torch.distributed as dist
+
+from .distributed import is_primary, rank, world_size
 
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 
 
 def atomic_save(path, value):
@@ -26,6 +29,19 @@ def atomic_save(path, value):
 
 def save_checkpoint(directory, *, model, optimizer, scaler, completed_epoch,
                     manifest, history):
+    # All ranks participate; only rank zero writes model/optimizer and files.
+    local_rng = {
+        "cpu": torch.get_rng_state(),
+        "cuda": (torch.cuda.get_rng_state().cpu()
+                 if next(model.parameters()).device.type == "cuda" else None),
+    }
+    rng_by_rank = [None] * world_size() if is_primary() else None
+    if dist.is_initialized():
+        dist.gather_object(local_rng, rng_by_rank, dst=0)
+    else:
+        rng_by_rank[0] = local_rng
+    if not is_primary():
+        return None
     directory = Path(directory)
     path = directory / f"epoch-{completed_epoch:06d}.pt"
     state = {
@@ -36,8 +52,7 @@ def save_checkpoint(directory, *, model, optimizer, scaler, completed_epoch,
         "scaler": scaler.state_dict(),
         "manifest": manifest,
         "history": history,
-        "rng": torch.get_rng_state(),
-        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        "rng_by_rank": rng_by_rank,
     }
     atomic_save(path, state)
     # The pointer is replaced only after the entire checkpoint is durable.
@@ -70,10 +85,13 @@ def load_checkpoint(path, *, model, optimizer, scaler, manifest):
         raise ValueError("Unsupported checkpoint format; start a new PyTorch run")
     if state["manifest"] != manifest:
         raise ValueError("Checkpoint data, model code or training settings differ")
+    if len(state["rng_by_rank"]) != world_size():
+        raise ValueError("Checkpoint world size differs")
     model.load_state_dict(state["model"])
     optimizer.load_state_dict(state["optimizer"])
     scaler.load_state_dict(state["scaler"])
-    torch.set_rng_state(state["rng"])
-    if state["cuda_rng"]:
-        torch.cuda.set_rng_state_all(state["cuda_rng"])
+    rng = state["rng_by_rank"][rank()]
+    torch.set_rng_state(rng["cpu"])
+    if rng["cuda"] is not None:
+        torch.cuda.set_rng_state(rng["cuda"])
     return state["completed_epoch"], state["history"]

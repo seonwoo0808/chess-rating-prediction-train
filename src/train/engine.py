@@ -2,6 +2,8 @@
 from contextlib import closing, nullcontext
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from tqdm.auto import tqdm
 
 
@@ -18,6 +20,10 @@ def run_epoch(model, dataset, *, device, precision, optimizer=None, scaler=None,
               progress=False, description=""):
     training = optimizer is not None
     model.train(training)
+    # Validation ranks may have different numbers of batches (including zero).
+    # Avoid DDP forward collectives; this model has no mutable training buffers.
+    if not training and isinstance(model, DistributedDataParallel):
+        model = model.module
     totals = torch.zeros(2, dtype=torch.float64, device=device)
     elements = 0
     iterator = iter(dataset)
@@ -66,6 +72,10 @@ def run_epoch(model, dataset, *, device, precision, optimizer=None, scaler=None,
             if progress and (bar.n % 20 == 0 or bar.n == len(dataset)):
                 loss_value, origin_mae = (totals / elements).tolist()
                 bar.set_postfix(loss=f"{loss_value:.4f}", origin_mae=f"{origin_mae:.1f}")
+    if dist.is_initialized():
+        combined = torch.cat((totals, totals.new_tensor([elements])))
+        dist.all_reduce(combined, op=dist.ReduceOp.SUM)
+        totals, elements = combined[:2], combined[2].item()
     if not elements:
         raise ValueError("Dataset yielded no games")
     loss_value, origin_mae = (totals / elements).tolist()

@@ -7,11 +7,14 @@ import math
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 
 from .checkpoint import atomic_save, load_checkpoint, save_checkpoint
 from .data import build_datasets, warmup_decoder
 from .data.manifest import dataset_manifest
 from .engine import PRECISIONS, run_epoch
+from .distributed import distributed_session, is_primary, rank, world_size
 from .models import build_model
 
 LOGGER = logging.getLogger(__name__)
@@ -49,34 +52,37 @@ def configure_runtime(seed, device, precision):
     device = torch.device(device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA was requested but is unavailable")
+    if device.type == "cuda":
+        device = torch.device("cuda", torch.cuda.current_device())
     if precision not in PRECISIONS:
         raise ValueError(f"Unsupported precision: {precision}")
     if precision == "float16" and device.type != "cuda":
         raise ValueError("float16 training requires CUDA; use float32 or bfloat16 on CPU")
     if precision == "bfloat16" and device.type == "cuda":
-        for index in range(torch.cuda.device_count()):
-            with torch.cuda.device(index):
-                if not torch.cuda.is_bf16_supported():
-                    raise ValueError(f"CUDA device {index} does not support bfloat16")
+        if not torch.cuda.is_bf16_supported():
+            raise ValueError(f"CUDA device {device.index} does not support bfloat16")
     torch.manual_seed(seed)
     return device
 
 
 def training_manifest(paths, data_options, *, device, precision, learning_rate):
     root = Path(__file__).parent
-    code_files = [*sorted((root / "models").glob("*.py")), root / "engine.py", root / "main.py"]
+    code_files = [*sorted((root / "models").glob("*.py")), root / "engine.py", root / "main.py",
+                  root / "distributed.py", root / "checkpoint.py"]
     return {
         "data": dataset_manifest(paths, **data_options),
         "model_code": {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
                        for path in code_files},
         "torch": str(torch.__version__),
         "device": device.type,
-        "replicas": torch.cuda.device_count() if device.type == "cuda" else 1,
+        "replicas": world_size(),
+        "parallelism": "ddp" if world_size() > 1 else "single",
         "precision": precision,
         "learning_rate": learning_rate,
     }
 
 
+@distributed_session
 def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
                  max_games=None, read_batch_size=512, decoder="numba",
                  shuffle_buffer=4096, prefetch_batches=2, seed=42, precision="float32", learning_rate=1e-4,
@@ -95,12 +101,18 @@ def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
     data_options = dict(
         batch_size=batch_size, validation_size=validation_size, max_games=max_games or None,
         read_batch_size=read_batch_size, decoder=decoder, shuffle_buffer=shuffle_buffer, seed=seed,
-        prefetch_batches=prefetch_batches,
+        prefetch_batches=prefetch_batches, world_size=world_size(),
     )
-    training, validation = build_datasets(paths, **data_options)
+    training, validation = build_datasets(paths, rank=rank(), **data_options)
     manifest = training_manifest(paths, data_options, device=device, precision=precision,
                                  learning_rate=learning_rate)
     model = build_model().to(device)
+    parallel_model = (DistributedDataParallel(
+        model, device_ids=[device.index] if device.type == "cuda" else None,
+    ) if world_size() > 1 else model)
+    # Identical initial weights, independent dropout streams thereafter.
+    if world_size() > 1:
+        torch.manual_seed(seed + rank())
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, eps=1e-7)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and precision == "float16")
     initial_epoch = 0
@@ -112,19 +124,22 @@ def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
         if initial_epoch > epochs:
             raise ValueError("epochs is smaller than the saved checkpoint epoch")
     warmup_decoder(decoder)
-    # One process keeps a single pair of Arrow file buffers for all visible GPUs.
-    parallel_model = (torch.nn.DataParallel(model) if device.type == "cuda"
-                      and torch.cuda.device_count() > 1 else model)
-    LOGGER.info("device=%s replicas=%d games=%d train=%d validation=%d batch=%d precision=%s",
-                device, manifest["replicas"], training.game_count + validation.game_count,
-                training.game_count, validation.game_count, batch_size, precision)
-    LOGGER.info("batch_prefetch=%d (0=inline preparation)", prefetch_batches)
+    if is_primary():
+        LOGGER.info("device=%s replicas=%d train=%d validation=%d global_batch=%d local_batch=%d precision=%s",
+                    device, manifest["replicas"], training.global_game_count,
+                    validation.global_game_count, batch_size, training.batch_size, precision)
+        LOGGER.info("batch_prefetch=%d per rank (0=inline preparation)", prefetch_batches)
+        if training.dropped_game_count:
+            LOGGER.info("DDP omits %d trailing training games to give ranks equal batch sizes",
+                        training.dropped_game_count)
+        if device.type == "cuda" and world_size() == 1 and torch.cuda.device_count() > 1:
+            LOGGER.warning("Using one GPU; launch with torchrun --nproc-per-node=N for DDP")
     for epoch in range(initial_epoch, epochs):
         training.set_epoch(epoch)
         train_metrics = run_epoch(
             parallel_model, training, device=device, precision=precision,
-            optimizer=optimizer, scaler=scaler, progress=verbose == 1,
-            description=f"Epoch {epoch + 1}/{epochs}",
+            optimizer=optimizer, scaler=scaler, progress=verbose == 1 and is_primary(),
+            description=f"Epoch {epoch + 1}/{epochs}" + (" (rank 0)" if world_size() > 1 else ""),
         )
         val_metrics = run_epoch(parallel_model, validation, device=device, precision=precision)
         for name, value in train_metrics.items():
@@ -133,17 +148,24 @@ def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
             history[f"val_{name}"].append(value)
         save_checkpoint(checkpoint_dir, model=model, optimizer=optimizer, scaler=scaler,
                         completed_epoch=epoch + 1, manifest=manifest, history=history)
-        if verbose:
+        if dist.is_initialized():
+            dist.barrier()
+        if verbose and is_primary():
             LOGGER.info("epoch=%d loss=%.6f origin_mae=%.3f val_loss=%.6f val_origin_mae=%.3f", epoch + 1,
                         train_metrics["loss"], train_metrics["origin_mae"],
                         val_metrics["loss"], val_metrics["origin_mae"])
-    destination = Path(output_dir)
-    atomic_save(destination / "model.pt", model.state_dict())
-    (destination / "history.json").write_text(json.dumps(history, indent=2) + "\n")
-    run_info = dict(manifest, completed_epoch=epochs, initial_epoch=initial_epoch,
-                    train_games=training.game_count, validation_games=validation.game_count,
-                    steps_per_epoch=len(training))
-    (destination / "run.json").write_text(json.dumps(run_info, indent=2) + "\n")
+    if is_primary():
+        destination = Path(output_dir)
+        atomic_save(destination / "model.pt", model.state_dict())
+        (destination / "history.json").write_text(json.dumps(history, indent=2) + "\n")
+        run_info = dict(manifest, completed_epoch=epochs, initial_epoch=initial_epoch,
+                        train_games=training.global_game_count,
+                        validation_games=validation.global_game_count,
+                        dropped_train_games=training.dropped_game_count,
+                        per_rank_batch_size=training.batch_size, steps_per_epoch=len(training))
+        (destination / "run.json").write_text(json.dumps(run_info, indent=2) + "\n")
+    if dist.is_initialized():
+        dist.barrier()
     return model, history
 
 
@@ -151,7 +173,8 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Train the PyTorch chess rating model")
     parser.add_argument("parquet", nargs="+", type=Path, help="Parquet files or directories")
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=128, help="Global batch across visible GPUs")
+    parser.add_argument("--batch-size", type=int, default=128,
+                        help="Global batch; must be divisible by torchrun world size")
     parser.add_argument("--validation-size", type=float, default=0.05)
     parser.add_argument("--max-games", type=int, default=0, help="0 means all games")
     parser.add_argument("--read-batch-size", type=int, default=512)
