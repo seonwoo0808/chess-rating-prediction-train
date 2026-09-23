@@ -31,9 +31,9 @@ def run_epoch(model, dataset, *, device, precision, optimizer=None, scaler=None,
     with scope as batches, tqdm(
         total=len(dataset), desc=description, disable=not progress,
     ) as bar:
-        for (boards, valid, game_type), targets in batches:
-            boards, valid, game_type, targets = (
-                tensor.to(device) for tensor in (boards, valid, game_type, targets))
+        for (boards, valid, clocks), targets in batches:
+            boards, valid, clocks, targets = (
+                tensor.to(device) for tensor in (boards, valid, clocks, targets))
             raw_targets = targets.float()
             if not torch.isfinite(raw_targets).all():
                 raise FloatingPointError("Non-finite rating target")
@@ -44,7 +44,7 @@ def run_epoch(model, dataset, *, device, precision, optimizer=None, scaler=None,
                 device_type=device.type, dtype=PRECISIONS[precision],
                 enabled=precision != "float32",
             ):
-                predictions = model(boards, valid, game_type)
+                predictions = model(boards, valid, clocks)
                 # Optimize the standardized target; this keeps the regression
                 # loss and its gradients at a numerically well-scaled magnitude.
                 error = predictions.float() - normalized_targets

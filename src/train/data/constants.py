@@ -1,4 +1,5 @@
-"""Board sequence length shared by the data pipeline."""
+"""Sequence length and provisional log-clock scaling constants."""
 MAX_PLIES = 128
-GAME_TYPES = ("Bullet", "Blitz", "Rapid", "Classical")
-NUM_GAME_TYPES = len(GAME_TYPES)
+# Estimated, not fitted: log1p(seconds), shared by training and inference.
+CLOCK_LOG_MEAN = 4.0
+CLOCK_LOG_STD = 1.2

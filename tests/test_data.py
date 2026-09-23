@@ -34,11 +34,14 @@ class DataTests(unittest.TestCase):
         self.games = [CASTLE, EN_PASSANT, PROMOTION, [], None,
                       moves('e2e4'), moves('d2d4', 'd7d5')]
         ply_type = pa.list_(pa.struct([('movement', pa.binary(2)), ('time', pa.uint32())]))
-        plies = [None if g is None else [dict(movement=m.to_bytes(2, 'little'), time=None)
-                                       for m in g] for g in self.games]
+        self.times = [None if g is None else [None if j % 3 == 1 else i * 100 + j
+                                            for j in range(len(g))]
+                      for i, g in enumerate(self.games)]
+        plies = [None if g is None else [dict(movement=m.to_bytes(2, 'little'), time=t)
+                                       for m, t in zip(g, ts)]
+                 for g, ts in zip(self.games, self.times)]
         pq.write_table(pa.table({
             'ply_list': pa.array(plies, type=ply_type),
-            "game_type": pa.array([[j == i % 4 for j in range(4)] for i in range(7)], type=pa.list_(pa.bool_())),
             'white_elo': pa.array(range(1000, 1007), type=pa.uint32()),
             'black_elo': pa.array(range(1500, 1507), type=pa.uint32()),
         }), self.path, row_group_size=3)
@@ -63,8 +66,9 @@ class DataTests(unittest.TestCase):
             boards = np.concatenate([x[0] for x, _ in blocks])
             valid = np.concatenate([x[1] for x, _ in blocks])
             targets = np.concatenate([y for _, y in blocks])
-            types = np.concatenate([x[2] for x, _ in blocks])
-            np.testing.assert_array_equal(types, np.eye(4)[np.arange(1, 7) % 4])
+            clocks = np.concatenate([x[2] for x, _ in blocks])
+            for i in range(6):
+                np.testing.assert_array_equal(clocks[i], self.expected_clocks(i + 1))
             for i, game in enumerate(self.games[1:]):
                 expected_board, expected_valid = board_sequence(game)
                 np.testing.assert_array_equal(boards[i], expected_board)
@@ -83,9 +87,9 @@ class DataTests(unittest.TestCase):
         self.assertEqual([len(y) for _, y in checking], [3])
         self.assertEqual(set(np.concatenate([y[:, 0] for _, y in training])), set(range(1000,1004)))
         np.testing.assert_array_equal(checking[0][1][:, 0], range(1004, 1007))
-        for (boards, valid, game_type), targets in training + checking:
-            expected = torch.eye(4)[(targets[:, 0].long() - 1000) % 4]
-            torch.testing.assert_close(game_type, expected)
+        for (boards, valid, clocks), targets in training + checking:
+            for clock, target in zip(clocks, targets):
+                np.testing.assert_array_equal(clock.numpy(), self.expected_clocks(int(target[0]) - 1000))
         from train.models import build_model
         model = build_model()
         model.eval()
@@ -94,30 +98,53 @@ class DataTests(unittest.TestCase):
         self.assertEqual(prediction.shape, (3, 2))
         self.assertTrue(np.isfinite(prediction).all())
 
-    def test_invalid_game_types_and_sliced_fixed_lists(self):
-        from train.data.parquet import arrow_numpy_columns, projected_columns
-        table = pq.read_table(self.path).combine_chunks()
-        index = table.schema.get_field_index("game_type")
-        for bad in (None, [True, False], [False] * 4, [True] * 4,
-                    [True, None, False, False], [float("nan"), 0., 0., 0.],
-                    [0.5, 0.5, 0., 0.], ["1", "0", "0", "0"]):
-            with self.subTest(bad=bad):
-                values = pa.array([bad] * len(table))
-                batch = table.set_column(index, "game_type", values).to_batches()[0]
-                with self.assertRaisesRegex(ValueError, "game_type"):
-                    arrow_numpy_columns(batch)
-        without = table.drop(["game_type"])
-        with self.assertRaisesRegex(ValueError, "game_type"):
-            arrow_numpy_columns(without.to_batches()[0])
-        pq.write_table(without, self.path)
-        with pq.ParquetFile(self.path) as source:
-            with self.assertRaisesRegex(ValueError, "game_type"):
-                projected_columns(source)
-        for dtype in (pa.list_(pa.bool_(), 4), pa.large_list(pa.bool_())):
-            values = pa.array([[j == i % 4 for j in range(4)] for i in range(7)], type=dtype)
-            batch = table.set_column(index, "game_type", values).slice(2, 3).to_batches()[0]
-            np.testing.assert_array_equal(arrow_numpy_columns(batch)[-1],
-                                          np.eye(4)[np.arange(2, 5) % 4])
+    def expected_clocks(self, index):
+        result = np.zeros((128, 2), np.float32)
+        for j, seconds in enumerate(self.times[index] or []):
+            if seconds is not None:
+                result[j] = [seconds, 1]
+        return result
+
+    def test_invalid_clocks_and_missing_column(self):
+        from train.data.parquet import arrow_numpy_columns
+        def batch(times, dtype=pa.float64()):
+            return pa.record_batch({
+                'white_elo': [1200], 'black_elo': [1400],
+                'ply_list': pa.array([[{'movement': 12 | (28 << 6), 'time': t} for t in times]],
+                                    type=pa.list_(pa.struct([('movement', pa.uint16()), ('time', dtype)]))),
+            })
+        for value in (-1, float('nan'), float('inf')):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'time'):
+                arrow_numpy_columns(batch([value]))
+        with self.assertRaisesRegex(TypeError, 'time'):
+            arrow_numpy_columns(batch(['bad'], pa.string()))
+        np.testing.assert_array_equal(arrow_numpy_columns(batch([None, 0, 60]))[-1],
+                                      [[0, 0], [0, 1], [60, 1]])
+        np.testing.assert_array_equal(arrow_numpy_columns(batch([None], pa.null()))[-1], [[0, 0]])
+        # Legacy inputs with no clock field stay usable, but contribute no time embedding.
+        for plies in (pa.array([[12 | (28 << 6)]], type=pa.list_(pa.uint16())),
+                      pa.array([[{'movement': 12 | (28 << 6)}]],
+                               type=pa.list_(pa.struct([('movement', pa.uint16())])))):
+            pq.write_table(pa.table({'white_elo': [1200], 'black_elo': [1400],
+                                     'ply_list': plies}), self.path)
+            (_, _, clocks), _ = next(row_batches(self.path, None, decoder='python'))
+            self.assertFalse(clocks.any())
+
+    def test_clock_truncation_and_early_replay_stop(self):
+        # Repeated knight cycles provide a legal sequence longer than MAX_PLIES.
+        game = moves('g1f3', 'g8f6', 'f3g1', 'f6g8') * 33
+        broken = moves('e2e4', 'e2e3', 'e7e5')  # Empty source ends decoding at ply 2.
+        plies = [[{'movement': move, 'time': i} for i, move in enumerate(g)]
+                 for g in (game, broken)]
+        pq.write_table(pa.table({'white_elo': [1200, 1300], 'black_elo': [1400, 1500],
+                                 'ply_list': pa.array(plies)}), self.path)
+        for decoder in ('python', 'numba'):
+            (_, valid, clocks), _ = next(row_batches(self.path, None, decoder=decoder))
+            self.assertEqual(valid.sum(axis=1).tolist(), [128, 1])
+            np.testing.assert_array_equal(clocks[0, :, 0], np.arange(128))
+            self.assertTrue((clocks[0, :, 1] == 1).all())
+            np.testing.assert_array_equal(clocks[1, 0], [0, 1])
+            self.assertFalse(clocks[1, 1:].any())
 
     def test_invalid_data(self):
         with self.assertRaises(ValueError):

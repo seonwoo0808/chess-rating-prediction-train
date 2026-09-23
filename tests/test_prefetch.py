@@ -28,10 +28,9 @@ class PrefetchTests(unittest.TestCase):
             path = Path(self.tmp.name) / f'{i}.parquet'
             move = (12 | (28 << 6)).to_bytes(2, 'little')
             table = pa.table({
-                "game_type": pa.array([[j == i % 4 for j in range(4)] for i in range(5)], type=pa.list_(pa.bool_())),
                 'white_elo': pa.array(range(i * 5 + 1000, i * 5 + 1005), type=pa.uint32()),
                 'black_elo': pa.array(range(i * 5 + 1500, i * 5 + 1505), type=pa.uint32()),
-                'ply_list': pa.array([[{'movement': move, 'time': 300}]] * 5,
+                'ply_list': pa.array([[{'movement': move, 'time': 1000 + i * 5 + j}] for j in range(5)],
                                      type=pa.list_(pa.struct([('movement', pa.binary(2)),
                                                             ('time', pa.uint32())]))),
             })
@@ -52,9 +51,10 @@ class PrefetchTests(unittest.TestCase):
                                    batch_size=4, decoder='python')
         for _ in range(2):
             batches = list(train)
-            for (_, _, game_type), targets in batches:
-                indices = ((targets[:, 0].long() - 1000) % 5) % 4
-                torch.testing.assert_close(game_type, torch.eye(4)[indices])
+            for (_, _, clocks), targets in batches:
+                torch.testing.assert_close(clocks[:, 0, 0], targets[:, 0])
+                self.assertTrue((clocks[:, 0, 1] == 1).all())
+                self.assertFalse(clocks[:, 1:].any())
             ys = np.concatenate([y[:, 0] for _, y in batches])
             np.testing.assert_array_equal(np.sort(ys), range(1000, 1009))
         ys = np.concatenate([y[:, 0] for _, y in val])
@@ -69,7 +69,7 @@ class PrefetchTests(unittest.TestCase):
             self.assertLessEqual(sum(r() is not None for r in references), 1)
             table = load_file(selection, cancelled)
             self.assertEqual([f.name for f in table.column('ply_list').type.value_type],
-                             ['movement'])
+                             ['movement', 'time'])
             references.append(weakref.ref(table))
             if selection.path == self.paths[1]:
                 second_ready.set()

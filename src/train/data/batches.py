@@ -7,7 +7,7 @@ from typing import Optional
 
 import numpy as np
 
-from .constants import MAX_PLIES, NUM_GAME_TYPES
+from .constants import MAX_PLIES
 from .decoder import board_sequence, compiled_decoder, readonly_array
 from .parquet import column_batches
 
@@ -38,10 +38,10 @@ def decode_batches(source, *, generator_batch_size=512, decoder="numba"):
     if decoder not in ("numba", "python"):
         raise ValueError("decoder must be numba or python")
     kernel = compiled_decoder() if decoder == "numba" else None
-    boards = valid = targets = game_types = None
+    boards = valid = targets = clocks = None
     filled = 0
     with closing(iter(source)) as source:
-        for moves, offsets, present, white, black, game_type in source:
+        for moves, offsets, present, white, black, flat_clocks in source:
             moves = readonly_array(moves, np.uint16)
             offsets = readonly_array(offsets, np.int64)
             present = readonly_array(np.ones(len(white), bool) if present is None else present,
@@ -51,12 +51,11 @@ def decode_batches(source, *, generator_batch_size=512, decoder="numba"):
                 if boards is None:
                     boards = np.empty((generator_batch_size, MAX_PLIES, 8, 8), np.int8)
                     valid = np.empty((generator_batch_size, MAX_PLIES), bool)
-                    game_types = np.empty((generator_batch_size, NUM_GAME_TYPES), np.float32)
+                    clocks = np.empty((generator_batch_size, MAX_PLIES, 2), np.float32)
                     targets = np.empty((generator_batch_size, 2), np.float32)
                 count = min(generator_batch_size-filled, len(white)-cursor)
                 end = cursor+count
                 target_end = filled+count
-                game_types[filled:target_end] = game_type[cursor:end]
                 targets[filled:target_end, 0] = white[cursor:end]
                 targets[filled:target_end, 1] = black[cursor:end]
                 if kernel is not None:
@@ -67,12 +66,18 @@ def decode_batches(source, *, generator_batch_size=512, decoder="numba"):
                         row = cursor+i
                         boards[filled+i], valid[filled+i] = board_sequence(
                             moves[offsets[row]:offsets[row+1]] if present[row] else moves[:0])
+                # Align clocks with decoded valid plies (including early replay stops).
+                # Vectorized gather keeps the compiled move decoder unchanged.
+                block = clocks[filled:target_end]
+                block.fill(0)
+                rows, steps = np.nonzero(valid[filled:target_end])
+                block[rows, steps] = flat_clocks[offsets[cursor + rows] + steps]
                 filled, cursor = target_end, end
                 if filled == generator_batch_size:
-                    yield (boards, valid, game_types), targets
-                    boards = valid = targets = game_types = None
+                    yield (boards, valid, clocks), targets
+                    boards = valid = targets = clocks = None
                     filled = 0
             # Release Arrow-backed views before the source advances to another file.
-            del moves, offsets, present, white, black, game_type
+            del moves, offsets, present, white, black, flat_clocks
         if filled:
-            yield (boards[:filled], valid[:filled], game_types[:filled]), targets[:filled]
+            yield (boards[:filled], valid[:filled], clocks[:filled]), targets[:filled]

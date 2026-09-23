@@ -8,21 +8,20 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .constants import NUM_GAME_TYPES
-
 def projected_columns(source):
-    """Use physical nested paths (including LIST wrappers) to omit clock data."""
+    """Use physical nested paths (including LIST wrappers) to read moves and optional clocks."""
     names = source.schema_arrow.names
-    for name in ("white_elo", "black_elo", "ply_list", "game_type"):
+    for name in ("white_elo", "black_elo", "ply_list"):
         if name not in names:
             raise ValueError(f"Parquet 필수 열이 없습니다: {name}")
     paths = [source.schema.column(i).path for i in range(len(source.schema))
              if source.schema.column(i).path.startswith("ply_list.")]
     movements = [path for path in paths if path.endswith(".movement")]
     if movements:
-        return ["white_elo", "black_elo", "game_type", *movements]
+        clocks = [path for path in paths if path.endswith(".time")]
+        return ["white_elo", "black_elo", *movements, *clocks]
     # Retain support for older list<uint16>/list<binary> inputs.
-    return ["white_elo", "black_elo", "game_type", "ply_list"]
+    return ["white_elo", "black_elo", "ply_list"]
 
 
 def movement_numpy(values):
@@ -63,8 +62,8 @@ def movement_numpy(values):
 
 
 def arrow_numpy_columns(batch):
-    """Return flat moves, per-game offsets/validity, and numeric ratings."""
-    for name in ("ply_list", "white_elo", "black_elo", "game_type"):
+    """Return flat moves, per-game offsets/validity, numeric ratings, and flat [seconds, present] clocks."""
+    for name in ("ply_list", "white_elo", "black_elo"):
         if batch.schema.get_field_index(name) < 0:
             raise ValueError(f"Parquet 필수 열이 없습니다: {name}")
     plies = batch.column(batch.schema.get_field_index("ply_list"))
@@ -73,11 +72,26 @@ def arrow_numpy_columns(batch):
     offsets = plies.offsets.to_numpy(zero_copy_only=False)
     first, last = int(offsets[0]), int(offsets[-1])
     children = plies.values.slice(first, last-first)
+    clocks = np.zeros((len(children), 2), dtype=np.float32)
     if pa.types.is_struct(children.type):
         if children.null_count:
             raise ValueError("ply_list 내부에 null 수가 있습니다.")
         if children.type.get_field_index("movement") < 0:
             raise ValueError("ply_list struct에 movement 필드가 없습니다.")
+        if children.type.get_field_index("time") >= 0:
+            times = children.field("time")
+            if not (pa.types.is_integer(times.type) or pa.types.is_floating(times.type)
+                    or pa.types.is_null(times.type)):
+                raise TypeError("ply_list.time must contain numeric seconds")
+            observed = times.is_valid().to_numpy(zero_copy_only=False)
+            if observed.any():
+                seconds = times.fill_null(0).to_numpy(zero_copy_only=False)
+                if np.any(~np.isfinite(seconds)) or np.any(seconds < 0):
+                    raise ValueError("ply_list.time must contain finite non-negative seconds")
+                clocks[:, 0] = seconds
+                if not np.isfinite(clocks[:, 0]).all():
+                    raise ValueError("ply_list.time exceeds float32 range")
+                clocks[:, 1] = observed
         children = children.field("movement")
     moves = movement_numpy(children)
     offsets = offsets-first
@@ -94,29 +108,7 @@ def arrow_numpy_columns(batch):
             raise ValueError(f"{name}에 유한하지 않은 값이 있습니다.")
         return result
 
-    types = batch.column(batch.schema.get_field_index("game_type"))
-    if not (pa.types.is_list(types.type) or pa.types.is_large_list(types.type)
-            or pa.types.is_fixed_size_list(types.type)):
-        raise ValueError("game_type must contain one-hot lists of length 4")
-    if types.null_count:
-        raise ValueError("game_type contains null rows")
-    if pa.types.is_fixed_size_list(types.type):
-        valid_lengths = types.type.list_size == NUM_GAME_TYPES
-    else:
-        valid_lengths = np.all(np.diff(types.offsets.to_numpy()) == NUM_GAME_TYPES)
-    if not valid_lengths:
-        raise ValueError("game_type must contain one-hot lists of length 4")
-    flat = types.flatten()
-    if flat.null_count or not (pa.types.is_boolean(flat.type)
-                              or pa.types.is_integer(flat.type)
-                              or pa.types.is_floating(flat.type)):
-        raise ValueError("game_type must contain non-null boolean or numeric values")
-    game_type = flat.to_numpy(zero_copy_only=False).reshape(-1, NUM_GAME_TYPES)
-    if not (np.all((game_type == 0) | (game_type == 1))
-            and np.all(game_type.sum(axis=1) == 1)):
-        raise ValueError("game_type must be one-hot in Bullet, Blitz, Rapid, Classical order")
-    return (moves, offsets, present, rating("white_elo"), rating("black_elo"),
-            game_type.astype(np.float32, copy=True))
+    return moves, offsets, present, rating("white_elo"), rating("black_elo"), clocks
 
 
 def column_batches(path: Path, max_games: Optional[int], *,
@@ -160,9 +152,9 @@ def column_batches(path: Path, max_games: Optional[int], *,
                 left, right = max(0, start-offset), min(batch.num_rows, stop-offset)
                 offset += batch.num_rows
                 if left < right:
-                    moves, offsets, present, white, black, game_type = arrow_numpy_columns(
+                    moves, offsets, present, white, black, clocks = arrow_numpy_columns(
                         batch.slice(left, right-left))
-                    yield moves, offsets, present, white, black, game_type
+                    yield moves, offsets, present, white, black, clocks
                 if offset >= stop:
                     return
             group_start = group_end

@@ -76,8 +76,8 @@ def batch_info(batch, replicas):
 
 
 def move_batch(batch, device):
-    (boards, valid, game_type), targets = batch
-    return ((boards.to(device), valid.to(device), game_type.to(device)), targets.to(device))
+    (boards, valid, clocks), targets = batch
+    return ((boards.to(device), valid.to(device), clocks.to(device)), targets.to(device))
 
 
 class Cycle:

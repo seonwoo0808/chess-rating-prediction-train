@@ -15,12 +15,11 @@ from train.models import build_model
 
 def write_games(path):
     move = (12 | (28 << 6)).to_bytes(2, "little")
-    ply_type = pa.list_(pa.struct([("movement", pa.binary(2))]))
+    ply_type = pa.list_(pa.struct([("movement", pa.binary(2)), ("time", pa.uint32())]))
     pq.write_table(pa.table({
-        "game_type": pa.array([[j == i % 4 for j in range(4)] for i in range(5)], type=pa.list_(pa.bool_())),
         "white_elo": [1000., 1200., 1400., 1600., 1800.],
         "black_elo": [1100., 1300., 1500., 1700., 1900.],
-        "ply_list": pa.array([[{"movement": move}]] * 5, type=ply_type),
+        "ply_list": pa.array([[{"movement": move, "time": t}] for t in (None, 0, 60, 180, 600)], type=ply_type),
     }), path, row_group_size=2)
 
 
