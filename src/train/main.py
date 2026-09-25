@@ -65,7 +65,8 @@ def configure_runtime(seed, device, precision):
     return device
 
 
-def training_manifest(paths, data_options, *, device, precision, learning_rate):
+def training_manifest(paths, data_options, *, device, precision, learning_rate,
+                      lr_step_size=1, lr_gamma=0.3):
     root = Path(__file__).parent
     code_files = [*sorted((root / "models").glob("*.py")), root / "engine.py", root / "main.py",
                   root / "distributed.py", root / "checkpoint.py"]
@@ -79,6 +80,7 @@ def training_manifest(paths, data_options, *, device, precision, learning_rate):
         "parallelism": "ddp" if world_size() > 1 else "single",
         "precision": precision,
         "learning_rate": learning_rate,
+        "lr_schedule": {"type": "StepLR", "step_size": lr_step_size, "gamma": lr_gamma},
     }
 
 
@@ -86,12 +88,17 @@ def training_manifest(paths, data_options, *, device, precision, learning_rate):
 def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
                  max_games=None, read_batch_size=512, decoder="numba",
                  shuffle_buffer=4096, prefetch_batches=2, seed=42, precision="float32", learning_rate=1e-4,
+                 lr_step_size=1, lr_gamma=0.3,
                  device="auto", checkpoint_dir="outputs/checkpoints", resume_from=None,
                  output_dir="outputs/run", verbose=1):
     if not isinstance(epochs, int) or epochs < 1:
         raise ValueError("epochs must be a positive integer")
     if not math.isfinite(learning_rate) or learning_rate <= 0:
         raise ValueError("learning_rate must be finite and positive")
+    if not isinstance(lr_step_size, int) or lr_step_size < 1:
+        raise ValueError("lr_step_size must be a positive integer")
+    if not math.isfinite(lr_gamma) or not 0 < lr_gamma < 1:
+        raise ValueError("lr_gamma must be finite and between 0 and 1")
     if verbose not in (0, 1, 2):
         raise ValueError("verbose must be 0, 1 or 2")
     if isinstance(data_paths, (str, Path)):
@@ -105,7 +112,8 @@ def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
     )
     training, validation = build_datasets(paths, rank=rank(), **data_options)
     manifest = training_manifest(paths, data_options, device=device, precision=precision,
-                                 learning_rate=learning_rate)
+                                 learning_rate=learning_rate, lr_step_size=lr_step_size,
+                                 lr_gamma=lr_gamma)
     model = build_model().to(device)
     parallel_model = (DistributedDataParallel(
         model, device_ids=[device.index] if device.type == "cuda" else None,
@@ -114,12 +122,15 @@ def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
     if world_size() > 1:
         torch.manual_seed(seed + rank())
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, eps=1e-7)
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=lr_step_size, gamma=lr_gamma)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and precision == "float16")
     initial_epoch = 0
     history = {"loss": [], "origin_mae": [], "val_loss": [], "val_origin_mae": []}
     if resume_from is not None:
         initial_epoch, history = load_checkpoint(
-            resume_from, model=model, optimizer=optimizer, scaler=scaler, manifest=manifest,
+            resume_from, model=model, optimizer=optimizer, scaler=scaler, scheduler=scheduler,
+            manifest=manifest, allow_pre_step_lr=True,
         )
         if initial_epoch > epochs:
             raise ValueError("epochs is smaller than the saved checkpoint epoch")
@@ -135,6 +146,9 @@ def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
         if device.type == "cuda" and world_size() == 1 and torch.cuda.device_count() > 1:
             LOGGER.warning("Using one GPU; launch with torchrun --nproc-per-node=N for DDP")
     for epoch in range(initial_epoch, epochs):
+        epoch_lr = optimizer.param_groups[0]["lr"]
+        if is_primary():
+            LOGGER.info("epoch=%d learning_rate=%.8g", epoch + 1, epoch_lr)
         training.set_epoch(epoch)
         train_metrics = run_epoch(
             parallel_model, training, device=device, precision=precision,
@@ -146,14 +160,16 @@ def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
             history[name].append(value)
         for name, value in val_metrics.items():
             history[f"val_{name}"].append(value)
+        scheduler.step()
         save_checkpoint(checkpoint_dir, model=model, optimizer=optimizer, scaler=scaler,
-                        completed_epoch=epoch + 1, manifest=manifest, history=history)
+                        scheduler=scheduler, completed_epoch=epoch + 1,
+                        manifest=manifest, history=history)
         if dist.is_initialized():
             dist.barrier()
         if verbose and is_primary():
-            LOGGER.info("epoch=%d loss=%.6f origin_mae=%.3f val_loss=%.6f val_origin_mae=%.3f", epoch + 1,
+            LOGGER.info("epoch=%d loss=%.6f origin_mae=%.3f val_loss=%.6f val_origin_mae=%.3f next_lr=%.8g", epoch + 1,
                         train_metrics["loss"], train_metrics["origin_mae"],
-                        val_metrics["loss"], val_metrics["origin_mae"])
+                        val_metrics["loss"], val_metrics["origin_mae"], scheduler.get_last_lr()[0])
     if is_primary():
         destination = Path(output_dir)
         atomic_save(destination / "model.pt", model.state_dict())
@@ -185,6 +201,10 @@ def build_parser():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--precision", choices=tuple(PRECISIONS), default="float32")
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--lr-step-size", type=int, default=1,
+                        help="StepLR interval in completed epochs (default: 1)")
+    parser.add_argument("--lr-gamma", type=float, default=0.3,
+                        help="StepLR multiplier at each interval (default: 0.3)")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("outputs/checkpoints"))
     parser.add_argument("--resume-from", type=Path, help="Checkpoint directory or epoch .pt file")

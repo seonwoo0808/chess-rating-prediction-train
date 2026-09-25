@@ -35,7 +35,9 @@ CUDA_VISIBLE_DEVICES=0,1 uv run --locked torchrun --standalone --nproc-per-node=
 
 `--batch-size`는 **전체 프로세스 합산 배치**입니다. 위 설정은 GPU당 64게임이며
 프로세스 수의 배수여야 합니다. GPU 4개면 `--nproc-per-node=4`로 바꿉니다.
-학습률은 자동으로 변경하지 않습니다. 데이터는 분할 후 각 rank에 연속 구간을
+학습률은 에포크 종료마다 StepLR로 조정합니다. 기본값은 1에포크 `1e-4`,
+2에포크 `3e-5`, 3에포크 `9e-6`이며 `--lr-step-size`와 `--lr-gamma`로
+간격과 배율을 바꿀 수 있습니다. 데이터는 분할 후 각 rank에 연속 구간을
 배정하여 해당 구간만 읽고 복원하고, 구간 안에서 에포크별로 셔플합니다.
 모든 rank의 학습 배치 크기와 스텝 수를 맞추기 위해 학습 끝부분의 최대
 `프로세스 수 - 1`게임을 제외합니다. 나머지 마지막 부분 배치는 보존하며,
@@ -178,10 +180,30 @@ prefetch 대기열은 프로세스마다 별도로 존재하므로 GPU 수를 �
 
 ## 저장과 재시작
 
+### 에포크 체크포인트 성능 비교
+
+학습을 중단한 뒤, 같은 게임에서 두 체크포인트의 MAE를 비교할 수 있습니다.
+서버의 `train` 프로젝트 디렉터리에서 실행하며 GPU가 있으면 한 장을 사용합니다.
+
+```bash
+python check_checkpoints.py \
+  outputs/checkpoints/epoch-000001.pt \
+  outputs/checkpoints/epoch-000002.pt \
+  --sample-games 4096 --batch-size 128
+```
+
+체크포인트에 기록된 원래 Parquet 파일과 학습/검증 분할을 사용합니다. 학습 범위와
+검증 범위의 앞·중간·뒤에서 각각 같은 연속 게임을 평가합니다. 작은 범위에서
+구간이 겹치면 중복 구간은 한 번만 표시합니다. `delta_last_minus_first`가 양수면
+나중 체크포인트의 MAE가 더 나쁩니다. 이 결과는 고정된 일부 게임의 평가이며
+전체 학습·검증 MAE를 대신하지 않습니다. 원본 데이터 파일이나 학습 코드가
+변경됐다면 비교를 중단합니다. 이 파일은 학습을 진행하거나 체크포인트를
+수정하지 않습니다.
+
 검증까지 완료한 에포크마다 `epoch-000001.pt` 등을 저장하고 `latest.json`을 갱신합니다.
 임시 파일을 모두 쓴 뒤 교체하므로 저장 실패 시 이전 최신 체크포인트를 유지합니다.
 rank 0만 파일을 저장하며 가중치에 `module.` 접두사를 붙이지 않습니다.
-가중치, Adam 상태, GradScaler 상태, **rank별** PyTorch CPU/CUDA 난수 상태와 전체 지표 이력을 저장합니다.
+가중치, Adam·StepLR·GradScaler 상태, **rank별** PyTorch CPU/CUDA 난수 상태와 전체 지표 이력을 저장합니다.
 스텝 중간 재시작은 지원하지 않습니다.
 
 ```bash
@@ -193,12 +215,27 @@ uv run train /data/lichess_monthly \
 
 DDP 재개는 처음과 같은 `torchrun --standalone --nproc-per-node=N -m train ...`
 명령에 `--resume-from`을 추가합니다. 프로세스 수와 배치 크기도 동일해야 합니다.
+StepLR 도입 직전 코드로 만든 **1에포크 체크포인트만** 같은 데이터·설정에서
+재개할 수 있습니다. 재개 시 2에포크 학습률을 `3e-5`로 설정합니다.
+기존 2에포크 체크포인트는 이미 높은 학습률로 진행됐으므로 이 전환을 허용하지 않습니다.
+다음처럼 명시적으로 1에포크 파일을 선택하고 새 체크포인트 디렉터리를 사용하세요.
+기존 `torchrun` 명령의 데이터 경로·GPU 수·배치 크기·정밀도를 그대로 두고
+다음 옵션을 추가합니다.
+
+```bash
+--epochs 3 \
+--resume-from outputs/checkpoints/epoch-000001.pt \
+--checkpoint-dir outputs/step-lr-checkpoints \
+--output-dir outputs/step-lr-run
+```
+
+`--epochs 3`은 전체 목표 에포크 수이며, 첫 실행과 같은 GPU 수가 필요합니다.
 체크포인트 형식은 v3입니다. 이전 DataParallel/v2 체크포인트는 재개하지 않으며
 새 체크포인트·출력 디렉터리에서 학습을 시작하세요. 경기 유형 버전 및 보드 전용 모델은
 `clock_projection.weight`와 정규화 buffer가 없어 그대로 불러오거나 재개할 수 없습니다.
 
 `--epochs`는 추가 횟수가 아니라 최종 에포크 번호입니다. 특정 `.pt` 파일도 지정할 수 있습니다.
-데이터 경로·크기·수정 시각, 전처리/모델/학습 코드, 배치·시드·정밀도·학습률·장치 종류·GPU 수·
+데이터 경로·크기·수정 시각, 전처리/모델/학습 코드, 배치·시드·정밀도·초기 학습률·StepLR 설정·장치 종류·GPU 수·
 PyTorch 버전을 비교하여 달라지면 재시작을 거부합니다. 파일 내용 전체를 해시하지는 않습니다.
 GPU 실행의 비결정적 연산까지 수치 재현을 보장하지는 않습니다.
 
