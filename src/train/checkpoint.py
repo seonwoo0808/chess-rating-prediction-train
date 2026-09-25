@@ -11,20 +11,45 @@ from .distributed import is_primary, rank, world_size
 
 
 FORMAT_VERSION = 3
-# The last version before epoch-based StepLR was added. Only its first-epoch
-# checkpoint can be migrated: later epochs already used a different LR history.
-PRE_STEP_LR_CODE_HASHES = {
-    "main.py": "ecd1b9277b9e6103d067ce0d6d776a9a799b6f4dbea6c2dc8f7a71f43889c4fb",
-    "checkpoint.py": "772e0a8e4cc2d895ccf600036325587d9fbe05440ada2cc61f599e30ac4978e9",
-}
+LEGACY_ORCHESTRATION_FILES = ("main.py", "checkpoint.py")
+
+
+def pre_step_lr_expected_manifest(current, saved):
+    """Retain all data/model/optimizer settings; permit old orchestration code."""
+    expected = dict(current)
+    expected.pop("lr_schedule", None)
+    codes = dict(current["model_code"])
+    for name in LEGACY_ORCHESTRATION_FILES:
+        if name in saved.get("model_code", {}):
+            codes[name] = saved["model_code"][name]
+    expected["model_code"] = codes
+    return expected
 
 
 def is_pre_step_lr_manifest(saved, current):
-    """Accept only the exact preceding training code and unchanged data/settings."""
-    expected = dict(current)
-    expected.pop("lr_schedule", None)
-    expected["model_code"] = dict(current["model_code"], **PRE_STEP_LR_CODE_HASHES)
-    return saved == expected
+    """The old first epoch may resume when model/data and settings still match."""
+    return saved == pre_step_lr_expected_manifest(current, saved)
+
+
+def manifest_mismatch_details(saved, expected):
+    """Summarize relevant differences without printing every file or hash."""
+    differences = []
+    saved_data, expected_data = saved.get("data", {}), expected.get("data", {})
+    for key in ("files", "preprocessing"):
+        if saved_data.get(key) != expected_data.get(key):
+            differences.append(f"data.{key}")
+    saved_config, expected_config = saved_data.get("config", {}), expected_data.get("config", {})
+    for key in sorted(saved_config.keys() | expected_config.keys()):
+        if saved_config.get(key) != expected_config.get(key):
+            differences.append(f"data.config.{key}: saved={saved_config.get(key)!r}, current={expected_config.get(key)!r}")
+    saved_code, expected_code = saved.get("model_code", {}), expected.get("model_code", {})
+    for key in sorted(saved_code.keys() | expected_code.keys()):
+        if saved_code.get(key) != expected_code.get(key):
+            differences.append(f"model_code.{key}")
+    for key in sorted((saved.keys() | expected.keys()) - {"data", "model_code"}):
+        if saved.get(key) != expected.get(key):
+            differences.append(f"{key}: saved={saved.get(key)!r}, current={expected.get(key)!r}")
+    return "; ".join(differences) or "unknown difference"
 
 
 def atomic_save(path, value):
@@ -104,7 +129,11 @@ def load_checkpoint(path, *, model, optimizer, scaler, manifest, scheduler=None,
               and state.get("scheduler") is None
               and is_pre_step_lr_manifest(state["manifest"], manifest))
     if state["manifest"] != manifest and not legacy:
-        raise ValueError("Checkpoint data, model code or training settings differ")
+        expected = (pre_step_lr_expected_manifest(manifest, state["manifest"])
+                    if allow_pre_step_lr and state["completed_epoch"] == 1
+                    and state.get("scheduler") is None else manifest)
+        raise ValueError("Checkpoint data, model code or training settings differ: "
+                         + manifest_mismatch_details(state["manifest"], expected))
     if scheduler is not None and not legacy and state.get("scheduler") is None:
         raise ValueError("Checkpoint has no StepLR state")
     if len(state["rng_by_rank"]) != world_size():
