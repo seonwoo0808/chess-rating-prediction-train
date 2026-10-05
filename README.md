@@ -56,6 +56,30 @@ GradScaler 사용 시 unscale 후 clipping하며, norm이 NaN/Inf이면 가중�
 `--verbose 1`은 배치 진행률, `2`는 에포크 요약,
 `0`은 학습 진행 표시를 끕니다. 데이터 적재 로그는 별도로 출력됩니다.
 
+### TensorBoard 모니터링
+
+학습 명령에 다음 옵션을 추가하면 rank 0의 최근 1,000배치 손실·MAE·학습률과
+매 에포크의 전체 GPU 합산 학습·검증 지표를 기록합니다. TensorBoard를 켜면
+`screen`에 줄을 덮어쓰는 진행 막대는 자동으로 꺼지고 에포크 요약 로그는 남습니다.
+`--log-every-steps`로 기록 간격을 조정할 수 있습니다. 최근 배치 지표는 rank 0의
+담당 데이터만 나타내며, 에포크 지표는 전체 rank를 합산한 값입니다.
+
+```bash
+--tensorboard-dir outputs/tensorboard/full-run --log-every-steps 1000
+```
+
+학습 서버의 다른 터미널에서 대시보드를 실행합니다.
+
+```bash
+uv run --locked tensorboard --logdir outputs/tensorboard/full-run --host 127.0.0.1 --port 6006
+```
+
+서버에 원격 접속 중이면 작업 컴퓨터에서 `ssh -L 6006:127.0.0.1:6006 사용자@서버`로
+포트를 연결하고 브라우저에서 `http://127.0.0.1:6006`을 엽니다. 이미 실행 중인
+학습 프로세스에는 옵션을 추가할 수 없습니다. 완료된 에포크 체크포인트에서 재개할 때
+옵션을 넣으면 이전 에포크 지표도 체크포인트 이력에서 TensorBoard에 표시합니다.
+재개할 때는 기존 학습의 데이터 파일 목록·설정과 GPU 수를 그대로 사용해야 합니다.
+
 ## 서버에서 uv 가상환경으로 실행
 
 uv와 NVIDIA 드라이버가 설치된 서버의 `train` 프로젝트 디렉터리에서 실행합니다.

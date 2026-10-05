@@ -12,6 +12,22 @@ from .distributed import is_primary, rank, world_size
 
 FORMAT_VERSION = 3
 LEGACY_ORCHESTRATION_FILES = ("main.py", "checkpoint.py")
+PRE_MONITORING_CODE_HASHES = {
+    "main.py": "ea82d24452186bc9edf307574460662d6ac26c96bd3849cf9f905f24a15d9724",
+    "engine.py": "9219ef1d1150b9fdfcd0b5c197d85ab1c8caad680218e2fb95f28",
+    "checkpoint.py": "65eda3fdcf674b1a6be5039c9e7d76987b08e6584603d817b4db5b6753f4610a",
+}
+
+
+def monitoring_expected_manifest(current):
+    """Manifest from the same training code before metrics-only logging."""
+    expected = dict(current)
+    expected["model_code"] = dict(current["model_code"], **PRE_MONITORING_CODE_HASHES)
+    return expected
+
+
+def is_monitoring_only_manifest(saved, current):
+    return saved == monitoring_expected_manifest(current)
 
 
 def pre_step_lr_expected_manifest(current, saved):
@@ -22,6 +38,8 @@ def pre_step_lr_expected_manifest(current, saved):
     for name in LEGACY_ORCHESTRATION_FILES:
         if name in saved.get("model_code", {}):
             codes[name] = saved["model_code"][name]
+    if saved.get("model_code", {}).get("engine.py") == PRE_MONITORING_CODE_HASHES["engine.py"]:
+        codes["engine.py"] = PRE_MONITORING_CODE_HASHES["engine.py"]
     expected["model_code"] = codes
     return expected
 
@@ -114,7 +132,7 @@ def save_checkpoint(directory, *, model, optimizer, scaler, completed_epoch,
 
 
 def load_checkpoint(path, *, model, optimizer, scaler, manifest, scheduler=None,
-                    allow_pre_step_lr=False):
+                    allow_pre_step_lr=False, allow_monitoring_only=False):
     path = Path(path)
     if path.is_dir():
         name = json.loads((path / "latest.json").read_text())["checkpoint"]
@@ -128,7 +146,9 @@ def load_checkpoint(path, *, model, optimizer, scaler, manifest, scheduler=None,
               and state["completed_epoch"] == 1
               and state.get("scheduler") is None
               and is_pre_step_lr_manifest(state["manifest"], manifest))
-    if state["manifest"] != manifest and not legacy:
+    monitoring_only = (allow_monitoring_only and state.get("scheduler") is not None
+                       and is_monitoring_only_manifest(state["manifest"], manifest))
+    if state["manifest"] != manifest and not legacy and not monitoring_only:
         expected = (pre_step_lr_expected_manifest(manifest, state["manifest"])
                     if allow_pre_step_lr and state["completed_epoch"] == 1
                     and state.get("scheduler") is None else manifest)

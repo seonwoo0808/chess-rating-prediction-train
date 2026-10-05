@@ -1,5 +1,6 @@
 """Collect data, construct a model, then train/validate/checkpoint each epoch."""
 import argparse
+from contextlib import closing, nullcontext
 import hashlib
 import json
 import logging
@@ -90,7 +91,8 @@ def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
                  shuffle_buffer=4096, prefetch_batches=2, seed=42, precision="float32", learning_rate=1e-4,
                  lr_step_size=1, lr_gamma=0.3,
                  device="auto", checkpoint_dir="outputs/checkpoints", resume_from=None,
-                 output_dir="outputs/run", verbose=1):
+                 output_dir="outputs/run", verbose=1, tensorboard_dir=None,
+                 log_every_steps=1000):
     if not isinstance(epochs, int) or epochs < 1:
         raise ValueError("epochs must be a positive integer")
     if not math.isfinite(learning_rate) or learning_rate <= 0:
@@ -101,6 +103,8 @@ def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
         raise ValueError("lr_gamma must be finite and between 0 and 1")
     if verbose not in (0, 1, 2):
         raise ValueError("verbose must be 0, 1 or 2")
+    if not isinstance(log_every_steps, int) or log_every_steps < 1:
+        raise ValueError("log_every_steps must be a positive integer")
     if isinstance(data_paths, (str, Path)):
         data_paths = (data_paths,)
     paths = collect_parquet_files(data_paths)
@@ -130,7 +134,7 @@ def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
     if resume_from is not None:
         initial_epoch, history = load_checkpoint(
             resume_from, model=model, optimizer=optimizer, scaler=scaler, scheduler=scheduler,
-            manifest=manifest, allow_pre_step_lr=True,
+            manifest=manifest, allow_pre_step_lr=True, allow_monitoring_only=True,
         )
         if initial_epoch > epochs:
             raise ValueError("epochs is smaller than the saved checkpoint epoch")
@@ -145,31 +149,63 @@ def run_training(data_paths, *, epochs=10, batch_size=128, validation_size=0.05,
                         training.dropped_game_count)
         if device.type == "cuda" and world_size() == 1 and torch.cuda.device_count() > 1:
             LOGGER.warning("Using one GPU; launch with torchrun --nproc-per-node=N for DDP")
-    for epoch in range(initial_epoch, epochs):
-        epoch_lr = optimizer.param_groups[0]["lr"]
-        if is_primary():
-            LOGGER.info("epoch=%d learning_rate=%.8g", epoch + 1, epoch_lr)
-        training.set_epoch(epoch)
-        train_metrics = run_epoch(
-            parallel_model, training, device=device, precision=precision,
-            optimizer=optimizer, scaler=scaler, progress=verbose == 1 and is_primary(),
-            description=f"Epoch {epoch + 1}/{epochs}" + (" (rank 0)" if world_size() > 1 else ""),
-        )
-        val_metrics = run_epoch(parallel_model, validation, device=device, precision=precision)
-        for name, value in train_metrics.items():
-            history[name].append(value)
-        for name, value in val_metrics.items():
-            history[f"val_{name}"].append(value)
-        scheduler.step()
-        save_checkpoint(checkpoint_dir, model=model, optimizer=optimizer, scaler=scaler,
-                        scheduler=scheduler, completed_epoch=epoch + 1,
-                        manifest=manifest, history=history)
-        if dist.is_initialized():
-            dist.barrier()
-        if verbose and is_primary():
-            LOGGER.info("epoch=%d loss=%.6f origin_mae=%.3f val_loss=%.6f val_origin_mae=%.3f next_lr=%.8g", epoch + 1,
-                        train_metrics["loss"], train_metrics["origin_mae"],
-                        val_metrics["loss"], val_metrics["origin_mae"], scheduler.get_last_lr()[0])
+    writer = None
+    if tensorboard_dir is not None and is_primary():
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError as exc:
+            raise RuntimeError("TensorBoard is unavailable; run uv sync --locked") from exc
+        writer = SummaryWriter(log_dir=str(tensorboard_dir),
+                               purge_step=initial_epoch * len(training), flush_secs=30)
+        LOGGER.info("tensorboard_dir=%s log_every_steps=%d", tensorboard_dir, log_every_steps)
+        for completed in range(initial_epoch):
+            for metric, tag in (("loss", "epoch/train_loss"),
+                                ("origin_mae", "epoch/train_mae"),
+                                ("val_loss", "epoch/val_loss"),
+                                ("val_origin_mae", "epoch/val_mae")):
+                writer.add_scalar(tag, history[metric][completed], completed + 1)
+        writer.flush()
+    with closing(writer) if writer is not None else nullcontext():
+        for epoch in range(initial_epoch, epochs):
+            epoch_lr = optimizer.param_groups[0]["lr"]
+            if is_primary():
+                LOGGER.info("epoch=%d learning_rate=%.8g", epoch + 1, epoch_lr)
+            training.set_epoch(epoch)
+            on_step = None
+            if writer is not None:
+                def on_step(local_step, loss_value, mae_value):
+                    step = epoch * len(training) + local_step
+                    writer.add_scalar("train_rank0/window_loss", loss_value, step)
+                    writer.add_scalar("train_rank0/window_mae", mae_value, step)
+                    writer.add_scalar("train_rank0/learning_rate", epoch_lr, step)
+            train_metrics = run_epoch(
+                parallel_model, training, device=device, precision=precision,
+                optimizer=optimizer, scaler=scaler,
+                progress=verbose == 1 and is_primary() and writer is None,
+                description=f"Epoch {epoch + 1}/{epochs}" + (" (rank 0)" if world_size() > 1 else ""),
+                on_step=on_step, log_every_steps=log_every_steps,
+            )
+            val_metrics = run_epoch(parallel_model, validation, device=device, precision=precision)
+            for name, value in train_metrics.items():
+                history[name].append(value)
+            for name, value in val_metrics.items():
+                history[f"val_{name}"].append(value)
+            if writer is not None:
+                writer.add_scalar("epoch/train_loss", train_metrics["loss"], epoch + 1)
+                writer.add_scalar("epoch/train_mae", train_metrics["origin_mae"], epoch + 1)
+                writer.add_scalar("epoch/val_loss", val_metrics["loss"], epoch + 1)
+                writer.add_scalar("epoch/val_mae", val_metrics["origin_mae"], epoch + 1)
+                writer.flush()
+            scheduler.step()
+            save_checkpoint(checkpoint_dir, model=model, optimizer=optimizer, scaler=scaler,
+                            scheduler=scheduler, completed_epoch=epoch + 1,
+                            manifest=manifest, history=history)
+            if dist.is_initialized():
+                dist.barrier()
+            if verbose and is_primary():
+                LOGGER.info("epoch=%d loss=%.6f origin_mae=%.3f val_loss=%.6f val_origin_mae=%.3f next_lr=%.8g", epoch + 1,
+                            train_metrics["loss"], train_metrics["origin_mae"],
+                            val_metrics["loss"], val_metrics["origin_mae"], scheduler.get_last_lr()[0])
     if is_primary():
         destination = Path(output_dir)
         atomic_save(destination / "model.pt", model.state_dict())
@@ -209,6 +245,10 @@ def build_parser():
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("outputs/checkpoints"))
     parser.add_argument("--resume-from", type=Path, help="Checkpoint directory or epoch .pt file")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/run"))
+    parser.add_argument("--tensorboard-dir", type=Path,
+                        help="Write rank-0 step metrics and global epoch metrics; disables progress bar")
+    parser.add_argument("--log-every-steps", type=int, default=1000,
+                        help="Rank-0 training steps per TensorBoard sample (default: 1000)")
     parser.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1,
                         help="0=no progress, 1=progress bar, 2=epoch summaries")
     return parser

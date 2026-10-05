@@ -26,6 +26,15 @@ class EngineTests(unittest.TestCase):
         metrics = run_epoch(ZeroModel(), batches, device=torch.device("cpu"), precision="float32")
         self.assertEqual(metrics, {"loss": 3.0, "origin_mae": 600.0})
 
+    def test_step_callback_reports_recent_batches(self):
+        batches = [((torch.zeros(n, 1, 8, 8, dtype=torch.int8), torch.ones(n, 1, dtype=torch.bool), torch.zeros(n, 1, 2)),
+                    torch.full((n, 2), rating)) for n, rating in ((3, 2060.), (1, 2860.))]
+        received = []
+        run_epoch(ZeroModel(), batches, device=torch.device("cpu"), precision="float32",
+                  on_step=lambda step, loss, mae: received.append((step, loss, mae)),
+                  log_every_steps=1)
+        self.assertEqual(received, [(1, 1.0, 400.0), (2, 9.0, 1200.0)])
+
     def test_clipping_bounds_update_after_unscaling(self):
         batches = [((torch.zeros(1, 1, 8, 8), torch.ones(1, 1, dtype=torch.bool), torch.zeros(1, 1, 2)),
                     torch.full((1, 2), 1660.0))]

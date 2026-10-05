@@ -17,7 +17,9 @@ MAX_GRAD_NORM = 1.0
 
 
 def run_epoch(model, dataset, *, device, precision, optimizer=None, scaler=None,
-              progress=False, description=""):
+              progress=False, description="", on_step=None, log_every_steps=1000):
+    if on_step is not None and log_every_steps < 1:
+        raise ValueError("log_every_steps must be positive")
     training = optimizer is not None
     model.train(training)
     # Validation ranks may have different numbers of batches (including zero).
@@ -26,6 +28,9 @@ def run_epoch(model, dataset, *, device, precision, optimizer=None, scaler=None,
         model = model.module
     totals = torch.zeros(2, dtype=torch.float64, device=device)
     elements = 0
+    steps = 0
+    window_totals = torch.zeros_like(totals) if on_step is not None else None
+    window_elements = 0
     iterator = iter(dataset)
     scope = closing(iterator) if hasattr(iterator, "close") else nullcontext(iterator)
     with scope as batches, tqdm(
@@ -67,9 +72,20 @@ def run_epoch(model, dataset, *, device, precision, optimizer=None, scaler=None,
             metric_error = detached * RATING_STD
             if not torch.isfinite(metric_error).all():
                 raise FloatingPointError("Non-finite original-scale MAE")
-            totals += torch.stack((detached.square().sum(), metric_error.abs().sum()))
-            elements += raw_targets.numel()
+            batch_totals = torch.stack((detached.square().sum(), metric_error.abs().sum()))
+            totals += batch_totals
+            batch_elements = raw_targets.numel()
+            elements += batch_elements
+            steps += 1
             bar.update(1)
+            if on_step is not None:
+                window_totals += batch_totals
+                window_elements += batch_elements
+                if steps % log_every_steps == 0 or steps == len(dataset):
+                    window_loss, window_mae = (window_totals / window_elements).tolist()
+                    on_step(steps, window_loss, window_mae)
+                    window_totals.zero_()
+                    window_elements = 0
             if progress and (bar.n % 20 == 0 or bar.n == len(dataset)):
                 loss_value, origin_mae = (totals / elements).tolist()
                 bar.set_postfix(loss=f"{loss_value:.4f}", origin_mae=f"{origin_mae:.1f}")
