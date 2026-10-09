@@ -14,7 +14,6 @@ class RatingModel(nn.Module):
         self.clock_projection = nn.Linear(2, 128, bias=False)
         self.register_buffer("clock_log_mean", torch.tensor(CLOCK_LOG_MEAN))
         self.register_buffer("clock_log_std", torch.tensor(CLOCK_LOG_STD))
-        self.positions = nn.Embedding(MAX_PLIES, 128)
         self.blocks = nn.ModuleList(TransformerBlock() for _ in range(4))
         self.norm = nn.LayerNorm(128, eps=1e-3)
         self.head = nn.Sequential(nn.Linear(128, 128), nn.GELU(), nn.Linear(128, 2))
@@ -39,7 +38,6 @@ class RatingModel(nn.Module):
         if not 1 <= steps <= MAX_PLIES:
             raise ValueError(f"steps must be in [1, {MAX_PLIES}]")
         values = self.board_encoder(boards, valid_steps)
-        values = values + self.positions(torch.arange(steps, device=boards.device))
         clock_features = self.normalize_clocks(clocks, valid_steps)
         values = values + self.clock_projection(clock_features.to(
             dtype=self.clock_projection.weight.dtype))
